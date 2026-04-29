@@ -40,10 +40,13 @@ OUTPUT_SUBTYPE_FALLBACK = "PCM_16"  # libsndfile 異常時の安全網
 OUTPUT_FORMAT = "FLAC"
 OUTPUT_EXT = ".flac"
 
-# ===== 負荷レベル (v1.3 Phase 3) =====
-LOAD_LEVELS = ("軽", "標準", "最大")
-LOAD_DEFAULT = "標準"
+# ===== 負荷レベル (v1.7 Phase M: 1-10 段階) =====
+LOAD_LEVEL_MIN = 1
+LOAD_LEVEL_MAX = 10
+LOAD_LEVEL_DEFAULT = 5
 STATE_INI_NAME = "state.ini"
+# 旧フォーマット ("軽"/"標準"/"最大") からの自動移行マップ
+_LEGACY_LOAD_MAP = {"軽": 2, "標準": 5, "最大": 9}
 
 
 def _state_ini_path():
@@ -51,22 +54,24 @@ def _state_ini_path():
     return os.path.join(base, STATE_INI_NAME)
 
 
-def load_level() -> str:
+def load_level() -> int:
     p = _state_ini_path()
     if not os.path.isfile(p):
-        return LOAD_DEFAULT
+        return LOAD_LEVEL_DEFAULT
     try:
         cp = configparser.ConfigParser()
         cp.read(p, encoding="utf-8")
-        lv = cp.get("ui", "load", fallback=LOAD_DEFAULT)
-        return lv if lv in LOAD_LEVELS else LOAD_DEFAULT
+        raw = cp.get("ui", "load", fallback=str(LOAD_LEVEL_DEFAULT))
+        if raw in _LEGACY_LOAD_MAP:
+            return _LEGACY_LOAD_MAP[raw]
+        lv = int(raw)
+        return max(LOAD_LEVEL_MIN, min(LOAD_LEVEL_MAX, lv))
     except Exception:
-        return LOAD_DEFAULT
+        return LOAD_LEVEL_DEFAULT
 
 
-def save_level(lv: str) -> None:
-    if lv not in LOAD_LEVELS:
-        return
+def save_level(lv: int) -> None:
+    lv = max(LOAD_LEVEL_MIN, min(LOAD_LEVEL_MAX, int(lv)))
     try:
         cp = configparser.ConfigParser()
         p = _state_ini_path()
@@ -74,26 +79,36 @@ def save_level(lv: str) -> None:
             cp.read(p, encoding="utf-8")
         if not cp.has_section("ui"):
             cp.add_section("ui")
-        cp.set("ui", "load", lv)
+        cp.set("ui", "load", str(lv))
         with open(p, "w", encoding="utf-8") as f:
             cp.write(f)
     except Exception:
         pass
 
 
-def threads_for_level(lv: str) -> int:
-    if lv == "軽":
+def _blas_threads(lv: int) -> int:
+    """負荷レベル 1-10 から BLAS/OMP スレッド数を計算。
+    Lv1=1スレッド, Lv10=全物理コア数, 2-9 は線形補間。
+    """
+    cpus = max(1, os.cpu_count() or 1)
+    if lv <= 1:
         return 1
-    if lv == "最大":
-        try:
-            return max(1, os.cpu_count() or 1)
-        except Exception:
-            return 1
-    return 0  # 標準: auto (threadpoolctl に None 相当を渡す)
+    if lv >= LOAD_LEVEL_MAX:
+        return cpus
+    return max(1, round(1 + (cpus - 1) * (lv - 1) / (LOAD_LEVEL_MAX - 1)))
 
 
-def resampy_parallel_for_level(lv: str) -> bool:
-    return lv != "軽"
+def _resampy_parallel(lv: int) -> bool:
+    """Lv4 以上で resampy numba 並列化を有効化。"""
+    return lv >= 4
+
+
+def _file_workers(lv: int) -> int:
+    """同時処理ファイル数。Lv1-5=1 (逐次), Lv6-10=2〜全コア/2 (並列)。"""
+    if lv <= 5:
+        return 1
+    cpus = max(1, os.cpu_count() or 1)
+    return min(2 + (lv - 6), max(1, cpus // 2))
 
 
 @dataclass(frozen=True)
@@ -391,16 +406,28 @@ class Worker(QtCore.QThread):
     sig_all = QtCore.Signal(int)
     sig_text = QtCore.Signal(str)
 
-    def __init__(self, files, level=LOAD_DEFAULT):
+    def __init__(self, files, level: int = LOAD_LEVEL_DEFAULT):
         super().__init__()
         self.files = files
-        self.level = level if level in LOAD_LEVELS else LOAD_DEFAULT
         self._abort = False
         self._pause = False
         self._mutex = QtCore.QMutex()
         self._wait = QtCore.QWaitCondition()
         self._failed: list[str] = []
         self._trash_failed = 0
+        self._level = max(LOAD_LEVEL_MIN, min(LOAD_LEVEL_MAX, int(level)))
+        import threading as _t
+        self._level_lock = _t.Lock()
+        self._trash_lock = _t.Lock()
+
+    def set_level(self, lv: int) -> None:
+        """処理中にリアルタイムで負荷レベルを変更する。次のファイルから反映。"""
+        with self._level_lock:
+            self._level = max(LOAD_LEVEL_MIN, min(LOAD_LEVEL_MAX, int(lv)))
+
+    def _get_level(self) -> int:
+        with self._level_lock:
+            return self._level
 
     def abort(self):
         self._mutex.lock()
@@ -422,94 +449,118 @@ class Worker(QtCore.QThread):
         self._mutex.unlock()
 
     def run(self):
-        total = len(self.files)
-        start = time.time()
-        succeeded = 0
+        from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: F401
 
         try:
-            from threadpoolctl import threadpool_limits
+            from threadpoolctl import threadpool_limits as _tpl
         except Exception:
-            threadpool_limits = None
+            _tpl = None
 
-        n_threads = threads_for_level(self.level)
+        total = len(self.files)
+        start_t = time.time()
+        succeeded = 0
+        completed_count = 0
+
+        # run() 開始時の level で BLAS スレッド数とnumba を初期設定
+        lv_init = self._get_level()
+        n_thr_init = _blas_threads(lv_init)
         try:
-            import numba  # noqa: F401
-            import numba.core.config as _nc
-            if n_threads > 0:
-                try:
-                    import numba as _nb
-                    _nb.set_num_threads(n_threads)
-                except Exception:
-                    pass
+            import numba as _nb
+            _nb.set_num_threads(n_thr_init)
         except Exception:
             pass
+        kw_init = {"limits": n_thr_init} if (_tpl and n_thr_init > 0) else None
+        outer_ctx = _tpl(**kw_init) if kw_init else _NullCtx()
 
-        resampy_parallel = resampy_parallel_for_level(self.level)
+        def _process_one(path: str, lv: int, use_step_cb: bool) -> str:
+            """単一ファイルを処理して "ok" / "trash_fail" を返す。"""
+            par = _resampy_parallel(lv)
 
-        limits_kw = None
-        if threadpool_limits is not None:
-            if n_threads == 0:
-                limits_kw = None
-            else:
-                limits_kw = {"limits": n_threads}
+            def step_cb(cur, m):
+                if use_step_cb:
+                    self.sig_step.emit(int(cur * 100 / m))
 
-        ctx = threadpool_limits(**limits_kw) if (threadpool_limits is not None and limits_kw) else _NullCtx()
-        with ctx:
-            for idx, path in enumerate(self.files, 1):
-                if self._abort:
-                    break
-
-                self._wait_if_paused()
-                if self._abort:
-                    break
-
-                self.sig_text.emit(f"{idx}/{total}")
-
+            y, sr = load_audio_safe(path)
+            if sr != PARAMS.target_sr:
                 try:
-                    y, sr = load_audio_safe(path)
+                    y = resampy.resample(y, sr, PARAMS.target_sr, parallel=par)
+                except TypeError:
+                    y = resampy.resample(y, sr, PARAMS.target_sr)
+                sr = PARAMS.target_sr
+            y_out = zansei_impl(
+                y, sr,
+                progress_cb=step_cb if use_step_cb else None,
+                abort_cb=lambda: self._abort,
+            )
+            out = os.path.join(OUTPUT_DIR, os.path.basename(path))
+            save_flac24_out(path, y_out, sr, out)
+            try:
+                send2trash(path)
+            except Exception:
+                return "trash_fail"
+            return "ok"
 
-                    if sr != PARAMS.target_sr:
-                        try:
-                            y = resampy.resample(y, sr, PARAMS.target_sr, parallel=resampy_parallel)
-                        except TypeError:
-                            y = resampy.resample(y, sr, PARAMS.target_sr)
-                        sr = PARAMS.target_sr
+        pending = list(self.files)
+        max_cpus = max(1, os.cpu_count() or 1)
+        in_flight: list = []  # (Future, path)
+        submit_idx = 0
 
-                    def step_cb(cur, m):
-                        self.sig_step.emit(int(cur * 100 / m))
+        with outer_ctx:
+            with ThreadPoolExecutor(max_workers=max_cpus) as executor:
+                while not self._abort:
+                    # ---- 完了 future を回収 ----
+                    still_running = []
+                    for fut, fpath in in_flight:
+                        if fut.done():
+                            completed_count += 1
+                            try:
+                                result = fut.result()
+                            except Exception:
+                                self._failed.append(os.path.basename(fpath))
+                            else:
+                                succeeded += 1
+                                if result == "trash_fail":
+                                    with self._trash_lock:
+                                        self._trash_failed += 1
+                            # 進捗テキスト更新
+                            elapsed = time.time() - start_t
+                            if completed_count > 0 and total > completed_count:
+                                remain = (elapsed / completed_count) * (total - completed_count)
+                                fail_n = len(self._failed)
+                                parts = []
+                                if fail_n:
+                                    parts.append(f"失敗{fail_n}")
+                                if self._trash_failed:
+                                    parts.append(f"ゴミ箱{self._trash_failed}")
+                                suffix = ("  " + "  ".join(parts)) if parts else ""
+                                self.sig_text.emit(f"{completed_count}/{total}  残り{int(remain)}秒{suffix}")
+                            self.sig_all.emit(int(completed_count * 100 / total))
+                            self.sig_step.emit(100)
+                        else:
+                            still_running.append((fut, fpath))
+                    in_flight = still_running
 
-                    y_out = zansei_impl(
-                        y, sr,
-                        progress_cb=step_cb,
-                        abort_cb=lambda: self._abort,
-                    )
+                    # ---- 終了判定 ----
+                    if not pending and not in_flight:
+                        break
 
-                    out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-                    save_flac24_out(path, y_out, sr, out)
+                    # ---- 一時停止 (新規投入前、QThread コンテキストで呼ぶ) ----
+                    self._wait_if_paused()
+                    if self._abort:
+                        break
 
-                    try:
-                        send2trash(path)
-                    except Exception:
-                        self._trash_failed += 1
+                    # ---- 現在の level に基づいてファイルを投入 ----
+                    lv = self._get_level()
+                    n_workers = _file_workers(lv)
+                    use_step = (n_workers <= 1)
+                    while pending and len(in_flight) < n_workers and not self._abort:
+                        fpath = pending.pop(0)
+                        submit_idx += 1
+                        self.sig_text.emit(f"{submit_idx}/{total}")
+                        fut = executor.submit(_process_one, fpath, lv, use_step)
+                        in_flight.append((fut, fpath))
 
-                    succeeded += 1
-
-                except Exception:
-                    self._failed.append(os.path.basename(path))
-
-            elapsed = time.time() - start
-            remain = (elapsed / idx) * (total - idx)
-            fail_n = len(self._failed)
-            parts = []
-            if fail_n:
-                parts.append(f"失敗{fail_n}")
-            if self._trash_failed:
-                parts.append(f"ゴミ箱{self._trash_failed}")
-            suffix = ("  " + "  ".join(parts)) if parts else ""
-            self.sig_text.emit(f"{idx}/{total}  残り{int(remain)}秒{suffix}")
-
-            self.sig_all.emit(int(idx * 100 / total))
-            self.sig_step.emit(100)
+                    time.sleep(0.05)
 
         fail_n = len(self._failed)
         trash_n = self._trash_failed
@@ -534,7 +585,7 @@ class MainWindow(QtWidgets.QWidget):
 
         self.setWindowTitle("DSRE")
         self.setWindowIcon(_app_icon())
-        self.resize(340, 210)
+        self.resize(340, 220)
 
         self.label = QtWidgets.QLabel("待機")
         self.pb_file = QtWidgets.QProgressBar()
@@ -544,11 +595,13 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_pause = QtWidgets.QPushButton("一時停止")
         self.btn_cancel = QtWidgets.QPushButton("取消")
 
-        self.cmb_level = QtWidgets.QComboBox()
-        self.cmb_level.addItems(list(LOAD_LEVELS))
         _lv = load_level()
-        idx_lv = LOAD_LEVELS.index(_lv) if _lv in LOAD_LEVELS else LOAD_LEVELS.index(LOAD_DEFAULT)
-        self.cmb_level.setCurrentIndex(idx_lv)
+        self.sld_level = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.sld_level.setRange(LOAD_LEVEL_MIN, LOAD_LEVEL_MAX)
+        self.sld_level.setValue(_lv)
+        self.sld_level.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBelow)
+        self.sld_level.setTickInterval(1)
+        self.lbl_level = QtWidgets.QLabel(f"負荷 {_lv}/{LOAD_LEVEL_MAX}")
 
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.label)
@@ -559,8 +612,8 @@ class MainWindow(QtWidgets.QWidget):
         layout.addWidget(self.btn_cancel)
 
         row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("負荷"))
-        row.addWidget(self.cmb_level, 1)
+        row.addWidget(self.lbl_level)
+        row.addWidget(self.sld_level, 1)
         layout.addLayout(row)
 
         self.setLayout(layout)
@@ -568,17 +621,16 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_start.clicked.connect(self.start)
         self.btn_pause.clicked.connect(self.pause)
         self.btn_cancel.clicked.connect(self.cancel)
-        # 負荷 ComboBox → _set_load_level で保存 + トレイ側と同期
-        self.cmb_level.currentTextChanged.connect(self._set_load_level)
+        self.sld_level.valueChanged.connect(self._on_level_changed)
 
         self.worker = None
         self._tray = None
-        self._load_actions: dict[str, QtGui.QAction] = {}
+        self._tray_level_act: "QtGui.QAction | None" = None
         self._setup_tray()
 
     # ---- トレイ ----
     def _setup_tray(self) -> None:
-        """システムトレイアイコン + 右クリックメニュー (開始/一時停止/取消/負荷サブメニュー/終了) を構築。"""
+        """システムトレイアイコン + 右クリックメニュー (開始/一時停止/取消/負荷±/終了) を構築。"""
         if not QtWidgets.QSystemTrayIcon.isSystemTrayAvailable():
             return
 
@@ -596,19 +648,13 @@ class MainWindow(QtWidgets.QWidget):
         menu.addAction("取消", self.cancel)
         menu.addSeparator()
 
-        # 負荷サブメニュー (排他ラジオ)
+        # 負荷サブメニュー: ◀ 現在値表示 ▶
         sub = menu.addMenu("負荷")
-        group = QtGui.QActionGroup(self)
-        group.setExclusive(True)
-        current = self.cmb_level.currentText()
-        for lv in LOAD_LEVELS:
-            act = QtGui.QAction(lv, self, checkable=True)
-            act.setChecked(lv == current)
-            act.triggered.connect(lambda _checked=False, name=lv: self._set_load_level(name))
-            group.addAction(act)
-            sub.addAction(act)
-            self._load_actions[lv] = act
-        self._load_action_group = group  # GC 防止のため保持
+        sub.addAction("◀ 減らす", lambda: self._adjust_level(-1))
+        lv_now = self.sld_level.value()
+        self._tray_level_act = sub.addAction(f"負荷: {lv_now}/{LOAD_LEVEL_MAX}")
+        self._tray_level_act.setEnabled(False)
+        sub.addAction("増やす ▶", lambda: self._adjust_level(+1))
 
         menu.addSeparator()
         menu.addAction("終了", self._quit_app)
@@ -617,21 +663,19 @@ class MainWindow(QtWidgets.QWidget):
         self._tray.activated.connect(self._on_tray)
         self._tray.show()
 
-    def _set_load_level(self, lv: str) -> None:
-        """UI コンボ / トレイサブメニューどちらから呼ばれても、双方と state.ini を同期する。"""
-        if lv not in LOAD_LEVELS:
-            return
+    def _on_level_changed(self, lv: int) -> None:
+        """スライダー変更時: ラベル更新 + 保存 + worker 伝播 + トレイ同期。"""
+        self.lbl_level.setText(f"負荷 {lv}/{LOAD_LEVEL_MAX}")
         save_level(lv)
-        # コンボ側を signal 循環なしで同期
-        if hasattr(self, "cmb_level") and self.cmb_level.currentText() != lv:
-            self.cmb_level.blockSignals(True)
-            try:
-                self.cmb_level.setCurrentText(lv)
-            finally:
-                self.cmb_level.blockSignals(False)
-        # トレイ側のチェック状態を同期
-        for name, act in self._load_actions.items():
-            act.setChecked(name == lv)
+        if self.worker and self.worker.isRunning():
+            self.worker.set_level(lv)
+        if self._tray_level_act is not None:
+            self._tray_level_act.setText(f"負荷: {lv}/{LOAD_LEVEL_MAX}")
+
+    def _adjust_level(self, delta: int) -> None:
+        """トレイの ◀ / ▶ からレベルを ±1 する。"""
+        lv = max(LOAD_LEVEL_MIN, min(LOAD_LEVEL_MAX, self.sld_level.value() + delta))
+        self.sld_level.setValue(lv)  # valueChanged → _on_level_changed が連鎖
 
     def _show_from_tray(self) -> None:
         self.showNormal()
@@ -680,7 +724,7 @@ class MainWindow(QtWidgets.QWidget):
         if not files:
             return
 
-        lv = self.cmb_level.currentText() if hasattr(self, "cmb_level") else LOAD_DEFAULT
+        lv = self.sld_level.value() if hasattr(self, "sld_level") else LOAD_LEVEL_DEFAULT
         self.worker = Worker(files, level=lv)
         self.worker.sig_step.connect(self.pb_file.setValue)
         self.worker.sig_all.connect(self.pb_all.setValue)
@@ -875,8 +919,9 @@ def _run_selftest() -> int:
 
         det_ok = True
         det_notes: list[str] = []
-        for lv in LOAD_LEVELS:
-            n_thr = threads_for_level(lv)
+        # Lv1 / Lv5 / Lv10 の代表3点で同一入力 × 2回実行が bit-identical かを確認
+        for lv_det in (LOAD_LEVEL_MIN, LOAD_LEVEL_DEFAULT, LOAD_LEVEL_MAX):
+            n_thr = _blas_threads(lv_det)
             kw = {"limits": n_thr} if n_thr > 0 else None
             try:
                 ctx1 = threadpoolctl.threadpool_limits(**kw) if kw else _NullCtx()
@@ -887,23 +932,59 @@ def _run_selftest() -> int:
                     y2 = zansei_impl(x_stereo.copy(), sr_proc)
             except Exception as e:
                 det_ok = False
-                det_notes.append(f"{lv}:EXC({type(e).__name__})")
+                det_notes.append(f"Lv{lv_det}:EXC({type(e).__name__})")
                 continue
             if not _np.all(_np.isfinite(y1)) or not _np.all(_np.isfinite(y2)):
-                det_notes.append(f"{lv}:NaN")
+                det_notes.append(f"Lv{lv_det}:NaN")
                 det_ok = False
                 continue
             if _np.array_equal(y1, y2):
-                det_notes.append(f"{lv}:OK")
+                det_notes.append(f"Lv{lv_det}:OK")
             else:
                 max_abs_det = float(_np.max(_np.abs(y1 - y2)))
-                det_notes.append(f"{lv}:diff(max={max_abs_det:.3e})")
+                det_notes.append(f"Lv{lv_det}:diff(max={max_abs_det:.3e})")
                 if max_abs_det > 1e-5:
                     det_ok = False
         if not det_ok:
             verdict = "DEGRADED"
 
-        # ---- (5) ffmpeg 同梱確認 ----
+        # ---- (5) Lv1 vs Lv10 zansei_impl 音質不変検証 (diff < 1e-9) ----
+        # zansei_impl は sosfiltfilt/hilbert/numpy 配列演算で構成され BLAS 非依存。
+        # スレッド数変更 (Lv1=1スレッド, Lv10=全コア) で出力が変わらないことを数値で保証。
+        det_lv_ok = True
+        det_lv_notes: list[str] = []
+        rng_lv = _np.random.default_rng(7777)
+        x_lv = rng_lv.standard_normal((2, 4096)).astype(_np.float32) * 0.05
+
+        for lv_a, lv_b in ((LOAD_LEVEL_MIN, LOAD_LEVEL_MAX),):
+            n_a = _blas_threads(lv_a)
+            n_b = _blas_threads(lv_b)
+            kw_a = {"limits": n_a} if n_a > 0 else None
+            kw_b = {"limits": n_b} if n_b > 0 else None
+            try:
+                ctx_a = threadpoolctl.threadpool_limits(**kw_a) if kw_a else _NullCtx()
+                with ctx_a:
+                    y_la = zansei_impl(x_lv.copy(), TARGET_SR)
+                ctx_b = threadpoolctl.threadpool_limits(**kw_b) if kw_b else _NullCtx()
+                with ctx_b:
+                    y_lb = zansei_impl(x_lv.copy(), TARGET_SR)
+            except Exception as e:
+                det_lv_notes.append(f"Lv{lv_a}vsLv{lv_b}:EXC({type(e).__name__})")
+                det_lv_ok = False
+                continue
+            if _np.array_equal(y_la, y_lb):
+                det_lv_notes.append(f"Lv{lv_a}vsLv{lv_b}:IDENTICAL")
+            else:
+                diff_lv = float(_np.max(_np.abs(y_la - y_lb)))
+                if diff_lv < 1e-9:
+                    det_lv_notes.append(f"Lv{lv_a}vsLv{lv_b}:OK(max={diff_lv:.2e})")
+                else:
+                    det_lv_notes.append(f"Lv{lv_a}vsLv{lv_b}:DIFF(max={diff_lv:.2e})")
+                    det_lv_ok = False
+        if not det_lv_ok:
+            verdict = "DEGRADED"
+
+        # ---- (6) ffmpeg 同梱確認 ----
         ffmpeg_path = _find_bundled(
             os.path.join("ffmpeg", "ffmpeg.exe"),
             os.path.join("_internal", "ffmpeg", "ffmpeg.exe"),
@@ -927,6 +1008,7 @@ def _run_selftest() -> int:
                 f"roundtrip={OUTPUT_FORMAT}/{OUTPUT_SUBTYPE}={rt_status} "
                 f"sosfiltfilt_equiv=[{eq_summary}] "
                 f"determinism=[{' '.join(det_notes)}] "
+                f"lv_det=[{' '.join(det_lv_notes)}] "
                 f"ffmpeg={ffmpeg_note}\n"
             )
         return 0 if verdict != "DEGRADED" else 1
