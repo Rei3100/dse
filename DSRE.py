@@ -29,7 +29,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 HARMONIC_LAYERS = 8         # 倍音重畳の段数
 HARMONIC_DECAY = 1.25       # 各段の減衰係数
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
-POST_HP_CUTOFF_HZ = 16000   # 倍音生成後のハイパス
+POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8: 16k→12k で 12-16kHz 帯域を通す)
 TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
@@ -376,7 +376,7 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
         if progress_cb:
             progress_cb(i + 1, total)
 
-    # 生成した倍音の低域を再度カット (16kHz 以上の高域のみに寄与、SOS で数値安定化)
+    # 生成した倍音の低域を再度カット (12kHz 以上の高域に寄与、SOS で数値安定化)
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
