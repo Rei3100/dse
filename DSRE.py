@@ -26,8 +26,9 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 
 
 # ===== DSP パラメータ =====
-HARMONIC_LAYERS = 8         # 倍音重畳の段数
-HARMONIC_DECAY = 1.25       # 各段の減衰係数
+HARMONIC_LAYERS = 8         # 倍音重畳の段数 (中域 0.06≤hf_ratio<0.12 時の標準値、adaptive で 4〜12 に変動)
+HARMONIC_DECAY = 0.85       # v1.9 Phase Q: 1.25→0.85 でフラット化、Layer 3 以降の倍音寄与を 3〜4 倍に増加
+MAX_ADAPTIVE_LAYERS = 12    # v1.9 Phase Q: 圧縮ロッシー音源 (hf_ratio < 0.03) 時の最大層数
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8: 16k→12k で 12-16kHz 帯域を通す)
 TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
@@ -114,6 +115,7 @@ def _file_workers(lv: int) -> int:
 @dataclass(frozen=True)
 class DSREParams:
     m: int = HARMONIC_LAYERS
+    max_m: int = MAX_ADAPTIVE_LAYERS  # v1.9 Phase Q: adaptive 上限
     decay: float = HARMONIC_DECAY
     pre_hp: int = PRE_HP_CUTOFF_HZ
     post_hp: int = POST_HP_CUTOFF_HZ
@@ -346,6 +348,53 @@ def safe_sosfiltfilt(sos, x, axis=-1):
     return y
 
 
+def measure_hf_ratio(x: np.ndarray, sr: int) -> float:
+    """4 kHz 以上のエネルギー比 (0=低域のみ, 1=高域のみ)。
+    DSEE HX adaptive 思想: 圧縮ロッシー (低 hf_ratio) ほど強化する判定材料。
+    stereo は 2ch 平均で測定 (チャンネル間相関による位相打消し対策)。
+    """
+    sig = np.mean(x, axis=0) if x.ndim > 1 else x
+    n = len(sig)
+    if n < 8:
+        return 0.0
+    spec = np.abs(np.fft.rfft(sig))
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+    energy = spec * spec
+    total = float(np.sum(energy)) + 1e-12
+    hf = float(np.sum(energy[freqs >= 4000.0]))
+    return hf / total
+
+
+def _spectral_centroid(x: np.ndarray, sr: int) -> float:
+    """振幅重み付き周波数中心 (Hz)。SC 上昇 = 高域寄りに重心移動 = 解像度感↑。
+    過剰な SC 上昇は耳疲れ要因 (ガード付き)。
+    """
+    sig = np.mean(x, axis=0) if x.ndim > 1 else x
+    n = len(sig)
+    if n < 8:
+        return 0.0
+    spec = np.abs(np.fft.rfft(sig))
+    freqs = np.fft.rfftfreq(n, d=1.0 / sr)
+    total = float(np.sum(spec)) + 1e-12
+    return float(np.sum(freqs * spec) / total)
+
+
+def _adaptive_layer_count(hf_ratio: float, max_m: int) -> int:
+    """hf_ratio から倍音層数を決定 (DSEE HX adaptive 思想)。
+    圧縮ロッシー (hf_ratio < 0.03) は最大強化、HF リッチ (≥ 0.20) は抑制。
+    max_m は MAX_ADAPTIVE_LAYERS (12) を上限としてクランプ。
+    """
+    if hf_ratio < 0.03:
+        return min(12, max_m)  # 圧縮ロッシー音源 → 最大強化
+    if hf_ratio < 0.06:
+        return min(10, max_m)
+    if hf_ratio < 0.12:
+        return min(8, max_m)   # 標準音源
+    if hf_ratio < 0.20:
+        return min(6, max_m)
+    return min(4, max_m)        # HF リッチ → 抑制
+
+
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     # 倍音抽出用 pre-HP (3kHz 以上を倍音生成素材に使う、SOS で数値安定化)
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
@@ -355,26 +404,30 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
     d_res = np.zeros_like(x)
 
-    total = PARAMS.m
-    decays = np.exp(-np.arange(1, total + 1) * PARAMS.decay)
+    # v1.9 Phase Q: 入力 hf_ratio に応じて層数を動的決定 (DSEE HX adaptive 思想)
+    # 圧縮ロッシー (低 HF) → 最大 12 層強化、HF リッチ → 4 層に抑制
+    hf_ratio = measure_hf_ratio(x, sr)
+    n_layers = _adaptive_layer_count(hf_ratio, PARAMS.max_m)
+    # decay 配列は決定された層数で生成 (HARMONIC_DECAY=0.85 で mid-upper を強化)
+    decays = np.exp(-np.arange(1, n_layers + 1) * PARAMS.decay)
     nyq = sr / 2.0
 
-    for i in range(total):
+    for i in range(n_layers):
         if abort_cb and abort_cb():
             break
 
-        shift = sr * (i + 1) / (total * 2.0)
+        shift = sr * (i + 1) / (n_layers * 2.0)
         # ナイキスト到達/超過のシフト層はスキップ (折り返しアーティファクト防止)。
-        # 現パラメータ (total=8, sr=96000) では最大 shift=48000=nyq なので最終層のみスキップ。
+        # 最終層は shift=nyq で常にスキップ (n_layers に依らず)。
         if shift >= nyq:
             if progress_cb:
-                progress_cb(i + 1, total)
+                progress_cb(i + 1, n_layers)
             continue
 
         d_res += f_dn(d_src, shift, d_sr) * decays[i]
 
         if progress_cb:
-            progress_cb(i + 1, total)
+            progress_cb(i + 1, n_layers)
 
     # 生成した倍音の低域を再度カット (12kHz 以上の高域に寄与、SOS で数値安定化)
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
@@ -386,7 +439,20 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     eps = 1e-12
     adj = src / (adp + src + eps)
 
-    result = (x + d_res) * adj
+    # v1.9 Phase Q: spectral centroid 過剰上昇ガード (耳疲れ防止)
+    # 出力 SC が入力 SC の 1.5 倍超 → 倍音ミックス量を縮小
+    sc_in = _spectral_centroid(x, sr)
+    candidate = (x + d_res) * adj
+    if sc_in > 1.0:
+        sc_out = _spectral_centroid(candidate, sr)
+        if sc_out > sc_in * 1.5:
+            blend = (sc_in * 1.5) / sc_out
+            result = (x + d_res * blend) * adj
+        else:
+            result = candidate
+    else:
+        result = candidate
+
     if not np.all(np.isfinite(result)):
         return np.clip(x, -1.0, 1.0)
     return result
@@ -763,7 +829,7 @@ def _run_selftest() -> int:
     verdict が DEGRADED のときは exit 1 → CI / build.ps1 / deploy.ps1 が artifact を作らない。
     QApplication は作らない (ヘッドレス環境で Qt platform plugin を走らせない)。
 
-    検査層 (v1.5 で FLAC PCM_24 ロードトリップに revert):
+    検査層 (v1.9 Phase Q で psychoacoustic A/B 追加):
       (1) 必須 import (numpy/scipy/librosa/resampy/soundfile/send2trash/PySide6/threadpoolctl)
       (2) FLAC <TARGET_SR=96 kHz> / PCM_24 roundtrip: shape + sr 一致 + 量子化誤差 < 1.5e-7 (2^-23)
           v1.4 の WAV FLOAT (1e-6 閾値) から revert、v1.6 で 96k に変更
@@ -771,7 +837,10 @@ def _run_selftest() -> int:
           Butterworth を回し、max_abs_diff < 1e-4 / rms_diff / rms_ref < 1e-5 を確認
           (旧が NaN を吐き新が有限値のときは IMPROVED)
       (4) 3 負荷 determinism: 同一入力 × 同一負荷で 2 回実行し bit 一致
-      (5) 同梱 ffmpeg の存在確認 (ビルド成果物でのみ意味がある、開発時はスキップ可)
+      (5) Lv1 vs Lv10 zansei_impl 出力一致 (BLAS 非依存性確認)
+      (6) Psychoacoustic A/B (v1.9): 合成低域信号を zansei_impl に通し、出力の
+          spectral_centroid と hf_ratio が両方上昇していれば IMPROVED、低下なら DEGRADED
+      (7) 同梱 ffmpeg の存在確認 (ビルド成果物でのみ意味がある、開発時はスキップ可)
     """
     import traceback
     log_dir = os.path.dirname(sys.executable) or os.getcwd()
@@ -984,7 +1053,56 @@ def _run_selftest() -> int:
         if not det_lv_ok:
             verdict = "DEGRADED"
 
-        # ---- (6) ffmpeg 同梱確認 ----
+        # ---- (6) Psychoacoustic A/B (v1.9 Phase Q) ----
+        # 圧縮ロッシー近似信号 (低域中心の合成サイン + ホワイトノイズ) を zansei_impl に通し、
+        # spectral_centroid と hf_ratio が両方上昇していれば DSEE HX 思想として IMPROVED。
+        # SC が 2 倍超に上昇したら過剰な高域化 → DEGRADED。
+        psy_notes: list[str] = []
+        try:
+            rng_psy = _np.random.default_rng(31415)
+            N_psy = 8192
+            t_psy = _np.arange(N_psy, dtype=_np.float32) / TARGET_SR
+            # 100/500/1000Hz サイン (圧縮音源の中低域中心スペクトラム近似)
+            sin1 = 0.15 * _np.sin(2 * _np.pi * 100.0 * t_psy)
+            sin2 = 0.10 * _np.sin(2 * _np.pi * 500.0 * t_psy)
+            sin3 = 0.08 * _np.sin(2 * _np.pi * 1000.0 * t_psy)
+            noise_psy = rng_psy.standard_normal(N_psy) * 0.015
+            x_psy_mono = (sin1 + sin2 + sin3 + noise_psy).astype(_np.float32)
+            x_psy = _np.stack([x_psy_mono, x_psy_mono], axis=0)
+
+            y_psy = zansei_impl(x_psy.copy(), TARGET_SR)
+
+            sc_in = _spectral_centroid(x_psy, TARGET_SR)
+            sc_out = _spectral_centroid(y_psy, TARGET_SR)
+            hf_in = measure_hf_ratio(x_psy, TARGET_SR)
+            hf_out = measure_hf_ratio(y_psy, TARGET_SR)
+            n_lay = _adaptive_layer_count(hf_in, PARAMS.max_m)
+
+            sc_up = sc_out > sc_in
+            hf_up = hf_out > hf_in
+            over_bright = sc_in > 1.0 and sc_out > sc_in * 2.0
+
+            tag = f"sc:{sc_in:.0f}→{sc_out:.0f}Hz hf:{hf_in:.3f}→{hf_out:.3f} layers={n_lay}"
+            if over_bright:
+                psy_notes.append(f"DEGRADED(over_bright {tag})")
+                verdict = "DEGRADED"
+            elif sc_up and hf_up:
+                psy_notes.append(f"IMPROVED({tag})")
+                if verdict == "EQUIV":
+                    verdict = "IMPROVED"
+            elif not sc_up:
+                psy_notes.append(f"DEGRADED(sc_drop {tag})")
+                verdict = "DEGRADED"
+            elif not hf_up:
+                psy_notes.append(f"DEGRADED(hf_drop {tag})")
+                verdict = "DEGRADED"
+            else:
+                psy_notes.append(f"EQUIV({tag})")
+        except Exception as e:
+            psy_notes.append(f"EXC({type(e).__name__})")
+            verdict = "DEGRADED"
+
+        # ---- (7) ffmpeg 同梱確認 ----
         ffmpeg_path = _find_bundled(
             os.path.join("ffmpeg", "ffmpeg.exe"),
             os.path.join("_internal", "ffmpeg", "ffmpeg.exe"),
@@ -1009,6 +1127,7 @@ def _run_selftest() -> int:
                 f"sosfiltfilt_equiv=[{eq_summary}] "
                 f"determinism=[{' '.join(det_notes)}] "
                 f"lv_det=[{' '.join(det_lv_notes)}] "
+                f"psy=[{' '.join(psy_notes)}] "
                 f"ffmpeg={ffmpeg_note}\n"
             )
         return 0 if verdict != "DEGRADED" else 1
