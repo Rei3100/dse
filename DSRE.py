@@ -32,6 +32,13 @@ PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8: 16k→12k で 12-16kHz 帯域を通す)
 TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
+# v1.10: Harmonic exciter (半波整流 + tanh サチュレータ) パラメータ
+# freq_shift 系倍音 (線形変位) では harmonic relationship が壊れて金属臭さが出るため、
+# 整数倍音を生む独立 signal path を並列追加。BBE Sonic Maximizer / tube exciter 系の手法。
+EXCITER_HP_HZ = 4000        # exciter ソース帯域 (これ以上の信号から倍音生成)
+EXCITER_OUT_HP_HZ = 7000    # exciter 出力 HP (これ以下は捨てる、原音中域への滲み防止)
+EXCITER_DRIVE = 0.22        # 加算ブレンド比 (0.22 = 控えめ、過剰歪回避)
+EXCITER_SAT_GAIN = 1.6      # tanh 入力ゲイン (歪量制御、1.6 = soft tube-like)
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
 #       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
@@ -123,6 +130,11 @@ class DSREParams:
     output_format: str = "FLAC"
     output_subtype: str = "PCM_24"
     output_subtype_fallback: str = "PCM_16"
+    # v1.10: Harmonic exciter (整数倍音 + tube-like saturation)
+    exciter_hp: int = EXCITER_HP_HZ
+    exciter_out_hp: int = EXCITER_OUT_HP_HZ
+    exciter_drive: float = EXCITER_DRIVE
+    exciter_sat_gain: float = EXCITER_SAT_GAIN
 
 
 PARAMS = DSREParams()
@@ -364,6 +376,56 @@ def measure_hf_ratio(x: np.ndarray, sr: int) -> float:
 
 
 
+def harmonic_exciter(x, sr, hp_hz=EXCITER_HP_HZ, out_hp_hz=EXCITER_OUT_HP_HZ,
+                     drive=EXCITER_DRIVE, sat_gain=EXCITER_SAT_GAIN):
+    """v1.10: 整数倍音生成型 harmonic exciter (BBE Sonic Maximizer / tube exciter 系)。
+
+    既存 zansei_impl の freq_shift 倍音 (Hilbert + 複素乗算による single-sideband shift)
+    は線形周波数変位なので、原音 4kHz+8kHz が +6kHz シフトで 10kHz+14kHz に化ける
+    = harmonic relationship (整数倍関係) が破壊される → 金属臭さ・不自然な高音乗りの源。
+
+    対して半波整流 + tanh ソフト歪は、原音 f0 から 2f0, 3f0, 4f0… を自然生成し、
+    harmonic relationship を保つ。両者を独立 path で blend することで、
+    freq_shift だけでは到達できない「自然な厚み + 解像感」を狙う。
+
+    Signal flow:
+      1. HP=hp_hz でソース帯域を分離 (中低域への漏れを断つ)
+      2. 半波整流 (max(x,0) + DC offset 除去) → 偶数倍音中心の歪み
+      3. tanh(src*sat_gain)/sat_gain → 奇数倍音 (tube-like soft clip)
+      4. half-rect と tanh を 50/50 ブレンド (偶奇両倍音バランス)
+      5. HP=out_hp_hz で生成倍音の高域成分のみ通過 (原音帯域への漏れ防止)
+      6. drive 倍率で原音に加算する量を制御
+    """
+    # 1. ソース帯域抽出 (4kHz 以上)
+    sos_in = safe_butter_sos(8, hp_hz, sr, btype="highpass")
+    src = safe_sosfiltfilt(sos_in, x, axis=-1)
+
+    src32 = src.astype(np.float32, copy=False)
+
+    # 2. 半波整流 (DC offset 除去、float32 精度維持)
+    rect = np.maximum(src32, 0.0)
+    if rect.ndim > 1:
+        rect = rect - np.mean(rect, axis=-1, keepdims=True)
+    else:
+        rect = rect - np.mean(rect)
+    rect = rect.astype(np.float32, copy=False)
+
+    # 3. tanh サチュレータ (奇数倍音、tube-like)
+    sat = (np.tanh(src32 * sat_gain) / sat_gain).astype(np.float32, copy=False)
+
+    # 4. 偶奇ブレンド
+    mixed = 0.5 * rect + 0.5 * sat
+
+    # 5. 出力 HP で生成倍音の高域成分のみ抽出
+    sos_out = safe_butter_sos(8, out_hp_hz, sr, btype="highpass")
+    excited = safe_sosfiltfilt(sos_out, mixed, axis=-1)
+
+    if not np.all(np.isfinite(excited)):
+        return np.zeros_like(x)
+
+    return (excited * drive).astype(x.dtype, copy=False)
+
+
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
     d_src = safe_sosfiltfilt(sos_pre, x, axis=-1)
@@ -394,7 +456,18 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
-    result = x + d_res
+    # v1.10: 整数倍音 exciter を並列加算 (freq_shift 系倍音と独立 path)。
+    # freq_shift は線形周波数変位で harmonic relationship を破壊するため、
+    # 整数倍音生成型 exciter で「自然な厚み」を補い解像感を引き上げる。
+    d_exc = harmonic_exciter(
+        x, sr,
+        hp_hz=PARAMS.exciter_hp,
+        out_hp_hz=PARAMS.exciter_out_hp,
+        drive=PARAMS.exciter_drive,
+        sat_gain=PARAMS.exciter_sat_gain,
+    )
+
+    result = x + d_res + d_exc
 
     if not np.all(np.isfinite(result)):
         return np.clip(x, -1.0, 1.0)
@@ -997,10 +1070,43 @@ def _run_selftest() -> int:
             hf_out = measure_hf_ratio(y_psy, TARGET_SR)
 
             tag = f"hf:{hf_in:.3f}→{hf_out:.3f}"
-            if hf_out > hf_in:
+            # v1.10: hf_ratio 30% 以上上昇で IMPROVED 昇格 (DSEE HX の "失われた高域推定" の核)
+            #        単に > のみなら EQUIV 並に弱い。30% は audible 改善の最小目安
+            HF_GAIN_THRESHOLD = 1.30
+            if hf_in > 1e-6 and hf_out >= hf_in * HF_GAIN_THRESHOLD:
+                psy_notes.append(f"IMPROVED({tag},×{hf_out/hf_in:.2f})")
+                if verdict == "EQUIV":
+                    verdict = "IMPROVED"
+            elif hf_out > hf_in:
                 psy_notes.append(f"OK({tag})")
             else:
                 psy_notes.append(f"WARN(no_hf_gain {tag})")
+
+            # v1.10: harmonic_exciter 単独 sanity (整数倍音生成 + DC offset 除去)
+            exc_only = harmonic_exciter(x_psy.copy(), TARGET_SR)
+            # exciter 出力は HP=7kHz 通過なので低域はほぼゼロ → 倍音帯域に集中
+            exc_dc = float(_np.mean(_np.abs(_np.mean(exc_only, axis=-1))))
+            exc_peak = float(_np.max(_np.abs(exc_only)))
+            exc_finite = bool(_np.all(_np.isfinite(exc_only)))
+            if not exc_finite:
+                psy_notes.append("EXC_NaN")
+                verdict = "DEGRADED"
+            elif exc_dc > 1e-3:
+                # 半波整流の DC offset が出力 HP で除去されているはず
+                psy_notes.append(f"EXC_DC_HIGH({exc_dc:.2e})")
+                verdict = "DEGRADED"
+            else:
+                # exciter 加算で原音より hf_ratio が確実に上昇しているかを別途確認
+                hf_with_exc = measure_hf_ratio(x_psy + exc_only, TARGET_SR)
+                exc_hf_gain = hf_with_exc - hf_in
+                # exciter 単独で hf_ratio +0.001 以上上昇を要求 (機能していることの保証)
+                if exc_hf_gain < 1e-3:
+                    psy_notes.append(f"EXC_NO_HF_GAIN(hf+={exc_hf_gain:+.3f})")
+                    verdict = "DEGRADED"
+                else:
+                    psy_notes.append(f"EXC_OK(peak={exc_peak:.3f},dc={exc_dc:.1e},hf+={exc_hf_gain:+.3f})")
+                    if verdict == "EQUIV":
+                        verdict = "IMPROVED"
         except Exception as e:
             psy_notes.append(f"EXC({type(e).__name__})")
             verdict = "DEGRADED"
