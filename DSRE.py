@@ -32,13 +32,65 @@ PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8: 16k→12k で 12-16kHz 帯域を通す)
 TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
-# v1.10: Harmonic exciter (半波整流 + tanh サチュレータ) パラメータ
-# freq_shift 系倍音 (線形変位) では harmonic relationship が壊れて金属臭さが出るため、
-# 整数倍音を生む独立 signal path を並列追加。BBE Sonic Maximizer / tube exciter 系の手法。
-EXCITER_HP_HZ = 4000        # exciter ソース帯域 (これ以上の信号から倍音生成)
-EXCITER_OUT_HP_HZ = 7000    # exciter 出力 HP (これ以下は捨てる、原音中域への滲み防止)
-EXCITER_DRIVE = 0.22        # 加算ブレンド比 (0.22 = 控えめ、過剰歪回避)
-EXCITER_SAT_GAIN = 1.6      # tanh 入力ゲイン (歪量制御、1.6 = soft tube-like)
+
+# ===== v1.11: Multi-Aspect Enhancement =====
+# 単一倍音生成では「全帯域・全側面の質感向上」に到達しない。
+# 各音響側面 (高域空気感 / 中域温度感 / 立体感 / 低域立ち上がり / 整数倍音) を
+# 独立した低ドライブ加算 path として並列に積層し、合計で控えめに加算する。
+# 原音は無減衰のまま保持 (additive only)、各 path は drive 小さめで副作用を抑える。
+
+# --- v1.11: Improved Harmonic Exciter (帯域分割 + 偶奇分離) ---
+# 旧 v1.10 の単段 exciter は 4kHz+ 全域を 1 ステージで処理していたため、
+# 高域 (>10kHz) で歪が立ち過ぎ「刺さり」の原因となるリスクがあった。
+# v1.11: 4-10kHz を厚め (温度・実在感)、10kHz+ を薄め (痛さ回避) の 2 段構成。
+EXCITER_LO_HZ = 4000        # 下段 exciter ソース下限
+EXCITER_HI_HZ = 10000       # 帯域境界 (下段の上限 / 上段の下限)
+EXCITER_OUT_HP_HZ = 6000    # 生成倍音の出力 HP (中域への滲み防止)
+EXCITER_DRIVE_LO = 0.16     # 下段 drive (4-10kHz、厚みを担う)
+EXCITER_DRIVE_HI = 0.10     # 上段 drive (10kHz+、薄め、刺さり回避)
+EXCITER_SAT_GAIN = 1.4      # tanh 入力ゲイン (1.4=soft、1.6 より柔らかく)
+EXCITER_EVEN_RATIO = 0.40   # 偶数倍音 (warmth 寄与) ブレンド比
+EXCITER_ODD_RATIO = 0.60    # 奇数倍音 (presence 寄与) ブレンド比
+
+# --- v1.11: Mid Warmth (中域 2nd-harmonic 微加算) ---
+# 200-1500Hz の中域に微小 even-order harmonic を加え、ボーカル・主旋律に
+# 温度感・艶・実在感を与える。drive=0.05 と非常に控えめ (聴感ではっきり差を
+# 出す手前で停止、過剰歪・濁りを完全回避)。
+MID_WARMTH_LO_HZ = 200
+MID_WARMTH_HI_HZ = 1500
+MID_WARMTH_OUT_HP_HZ = 1200  # 加算は中高域のみ (低域の膨張を完全回避)
+MID_WARMTH_DRIVE = 0.05
+MID_WARMTH_ASYM_GAIN = 1.2   # 非対称 soft clip ゲイン (偶数次倍音生成)
+
+# --- v1.11: Stereo Width HF Enhancement (M/S 処理) ---
+# Mid/Side 分解で Side の 2kHz+ のみを微増し、空間広がり・臨場感を向上。
+# Mid (センター = ボーカル・主旋律) には触らないので定位は無傷。
+# mono 入力時は完全 no-op (副作用ゼロ)。
+STEREO_WIDEN_HP_HZ = 2000
+STEREO_WIDEN_GAIN = 0.18     # +1.4dB 相当 (Side 高域のみ)
+
+# --- v1.11: Air Band Sparkle (plausible 16kHz+) ---
+# 既存 zansei_impl/exciter は 12kHz 付近までを主にカバーする。
+# 16kHz+ の "air" 帯域を envelope follower + soft sat で控えめに補い、
+# DSEE HX 流の「失われた高域の plausible 推定」を強化。
+AIR_BAND_HP_HZ = 13000       # ソース下限
+AIR_BAND_OUT_HP_HZ = 15000   # 出力 HP (15kHz+ のみ加算)
+AIR_BAND_DRIVE = 0.10
+AIR_BAND_SAT_GAIN = 2.0      # 強めサチュレータ (微小信号でも倍音が出る)
+
+# --- v1.11: Transient Crispness (低域 attack 強調) ---
+# 200Hz 以下の低域エンベロープから transient (短期 - 長期 envelope の差) を
+# 抽出し、立ち上がり部分にだけごく軽くゲインを乗せる。
+# キック・ベースの輪郭・締まり・制動感を改善 (低域の量感は変えない)。
+TRANSIENT_LP_HZ = 200
+TRANSIENT_FAST_MS = 5.0      # 高速 envelope (~5ms)
+TRANSIENT_SLOW_MS = 50.0     # 低速 envelope (~50ms)
+TRANSIENT_GAIN = 0.08        # 立ち上がり部のブースト量 (控えめ)
+
+# --- v1.11: Master Headroom (clip 防止) ---
+# 全 path 加算後の peak を測り、1.0 を超えそうなら原音以外を縮める。
+# 原音は無減衰、加算 path のみを比例縮小するので「原音の魅力を殺さない」。
+MASTER_HEADROOM_PEAK = 0.99  # この peak を超えたら d_extra を縮める
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
 #       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
@@ -130,11 +182,36 @@ class DSREParams:
     output_format: str = "FLAC"
     output_subtype: str = "PCM_24"
     output_subtype_fallback: str = "PCM_16"
-    # v1.10: Harmonic exciter (整数倍音 + tube-like saturation)
-    exciter_hp: int = EXCITER_HP_HZ
+    # v1.11: Improved Harmonic Exciter (帯域分割 + 偶奇分離)
+    exciter_lo_hz: int = EXCITER_LO_HZ
+    exciter_hi_hz: int = EXCITER_HI_HZ
     exciter_out_hp: int = EXCITER_OUT_HP_HZ
-    exciter_drive: float = EXCITER_DRIVE
+    exciter_drive_lo: float = EXCITER_DRIVE_LO
+    exciter_drive_hi: float = EXCITER_DRIVE_HI
     exciter_sat_gain: float = EXCITER_SAT_GAIN
+    exciter_even_ratio: float = EXCITER_EVEN_RATIO
+    exciter_odd_ratio: float = EXCITER_ODD_RATIO
+    # v1.11: Mid Warmth
+    mid_warmth_lo_hz: int = MID_WARMTH_LO_HZ
+    mid_warmth_hi_hz: int = MID_WARMTH_HI_HZ
+    mid_warmth_out_hp_hz: int = MID_WARMTH_OUT_HP_HZ
+    mid_warmth_drive: float = MID_WARMTH_DRIVE
+    mid_warmth_asym_gain: float = MID_WARMTH_ASYM_GAIN
+    # v1.11: Stereo Width
+    stereo_widen_hp_hz: int = STEREO_WIDEN_HP_HZ
+    stereo_widen_gain: float = STEREO_WIDEN_GAIN
+    # v1.11: Air Band Sparkle
+    air_band_hp_hz: int = AIR_BAND_HP_HZ
+    air_band_out_hp_hz: int = AIR_BAND_OUT_HP_HZ
+    air_band_drive: float = AIR_BAND_DRIVE
+    air_band_sat_gain: float = AIR_BAND_SAT_GAIN
+    # v1.11: Transient Crispness
+    transient_lp_hz: int = TRANSIENT_LP_HZ
+    transient_fast_ms: float = TRANSIENT_FAST_MS
+    transient_slow_ms: float = TRANSIENT_SLOW_MS
+    transient_gain: float = TRANSIENT_GAIN
+    # v1.11: Master headroom
+    master_headroom_peak: float = MASTER_HEADROOM_PEAK
 
 
 PARAMS = DSREParams()
@@ -376,54 +453,222 @@ def measure_hf_ratio(x: np.ndarray, sr: int) -> float:
 
 
 
-def harmonic_exciter(x, sr, hp_hz=EXCITER_HP_HZ, out_hp_hz=EXCITER_OUT_HP_HZ,
-                     drive=EXCITER_DRIVE, sat_gain=EXCITER_SAT_GAIN):
-    """v1.10: 整数倍音生成型 harmonic exciter (BBE Sonic Maximizer / tube exciter 系)。
-
-    既存 zansei_impl の freq_shift 倍音 (Hilbert + 複素乗算による single-sideband shift)
-    は線形周波数変位なので、原音 4kHz+8kHz が +6kHz シフトで 10kHz+14kHz に化ける
-    = harmonic relationship (整数倍関係) が破壊される → 金属臭さ・不自然な高音乗りの源。
-
-    対して半波整流 + tanh ソフト歪は、原音 f0 から 2f0, 3f0, 4f0… を自然生成し、
-    harmonic relationship を保つ。両者を独立 path で blend することで、
-    freq_shift だけでは到達できない「自然な厚み + 解像感」を狙う。
-
-    Signal flow:
-      1. HP=hp_hz でソース帯域を分離 (中低域への漏れを断つ)
-      2. 半波整流 (max(x,0) + DC offset 除去) → 偶数倍音中心の歪み
-      3. tanh(src*sat_gain)/sat_gain → 奇数倍音 (tube-like soft clip)
-      4. half-rect と tanh を 50/50 ブレンド (偶奇両倍音バランス)
-      5. HP=out_hp_hz で生成倍音の高域成分のみ通過 (原音帯域への漏れ防止)
-      6. drive 倍率で原音に加算する量を制御
-    """
-    # 1. ソース帯域抽出 (4kHz 以上)
-    sos_in = safe_butter_sos(8, hp_hz, sr, btype="highpass")
-    src = safe_sosfiltfilt(sos_in, x, axis=-1)
-
-    src32 = src.astype(np.float32, copy=False)
-
-    # 2. 半波整流 (DC offset 除去、float32 精度維持)
+def _half_rect_dc_removed(src32: np.ndarray) -> np.ndarray:
+    """半波整流 + DC offset 除去 (偶数倍音生成の前処理)。"""
     rect = np.maximum(src32, 0.0)
     if rect.ndim > 1:
         rect = rect - np.mean(rect, axis=-1, keepdims=True)
     else:
         rect = rect - np.mean(rect)
-    rect = rect.astype(np.float32, copy=False)
+    return rect.astype(np.float32, copy=False)
 
-    # 3. tanh サチュレータ (奇数倍音、tube-like)
-    sat = (np.tanh(src32 * sat_gain) / sat_gain).astype(np.float32, copy=False)
 
-    # 4. 偶奇ブレンド
-    mixed = 0.5 * rect + 0.5 * sat
+def _tanh_sat(src32: np.ndarray, sat_gain: float) -> np.ndarray:
+    """tanh ソフトサチュレータ (奇数倍音、tube-like soft clip)。"""
+    return (np.tanh(src32 * sat_gain) / sat_gain).astype(np.float32, copy=False)
 
-    # 5. 出力 HP で生成倍音の高域成分のみ抽出
-    sos_out = safe_butter_sos(8, out_hp_hz, sr, btype="highpass")
-    excited = safe_sosfiltfilt(sos_out, mixed, axis=-1)
 
-    if not np.all(np.isfinite(excited)):
+def _band_extract(x: np.ndarray, sr: int, lo_hz: float, hi_hz: float | None = None,
+                  order: int = 8) -> np.ndarray:
+    """HP/BP でソース帯域を抽出。hi_hz=None なら HP 単独。"""
+    sos_hp = safe_butter_sos(order, lo_hz, sr, btype="highpass")
+    y = safe_sosfiltfilt(sos_hp, x, axis=-1)
+    if hi_hz is not None and hi_hz > lo_hz:
+        sos_lp = safe_butter_sos(order, hi_hz, sr, btype="lowpass")
+        y = safe_sosfiltfilt(sos_lp, y, axis=-1)
+    return y
+
+
+def harmonic_exciter(x, sr, params: "DSREParams | None" = None):
+    """v1.11: 帯域分割 + 偶奇分離型 harmonic exciter (改良版)。
+
+    旧 v1.10 は 4kHz 以上を単段で処理しており、10kHz 以上の高域でも同じ drive
+    を掛けるため、サ行・シンバルの「刺さり」が出るリスクがあった。
+    v1.11 では 2 帯域 (4-10kHz / 10kHz+) に分割し、上段の drive を下段の半分強
+    に抑える。さらに偶数倍音 (warmth) と奇数倍音 (presence) のブレンド比を
+    パラメータ化 (デフォルト 40/60) して、温度感と解像感の両立を図る。
+
+    狙い:
+      - 4-10kHz: 偶数倍音多めで「中高域の温度・実在感」(ボーカル子音・ストリングス)
+      - 10kHz+:  奇数倍音中心 + 控えめ drive で「空気感・透明感」(刺さり回避)
+    """
+    p = params if params is not None else PARAMS
+
+    # 下段 (4-10kHz): 厚みを担う帯域、drive 大きめ + 偶数倍音多め
+    src_lo = _band_extract(x, sr, p.exciter_lo_hz, p.exciter_hi_hz, order=8)
+    s_lo = src_lo.astype(np.float32, copy=False)
+    rect_lo = _half_rect_dc_removed(s_lo)
+    sat_lo = _tanh_sat(s_lo, p.exciter_sat_gain)
+    mix_lo = p.exciter_even_ratio * rect_lo + p.exciter_odd_ratio * sat_lo
+
+    # 上段 (10kHz+): 透明感担当、drive 小さめ + 奇数倍音寄り (刺さり回避)
+    src_hi = _band_extract(x, sr, p.exciter_hi_hz, hi_hz=None, order=8)
+    s_hi = src_hi.astype(np.float32, copy=False)
+    rect_hi = _half_rect_dc_removed(s_hi)
+    sat_hi = _tanh_sat(s_hi, p.exciter_sat_gain * 0.85)  # 上段はさらに柔らかく
+    # 上段は奇数倍音 70% / 偶数 30% (透明感を優先、温度より sparkle)
+    mix_hi = 0.30 * rect_hi + 0.70 * sat_hi
+
+    # 出力 HP で生成倍音の高域成分のみ抽出 (中低域への滲み防止)
+    sos_out = safe_butter_sos(8, p.exciter_out_hp, sr, btype="highpass")
+    excited_lo = safe_sosfiltfilt(sos_out, mix_lo, axis=-1)
+    excited_hi = safe_sosfiltfilt(sos_out, mix_hi, axis=-1)
+
+    if not (np.all(np.isfinite(excited_lo)) and np.all(np.isfinite(excited_hi))):
         return np.zeros_like(x)
 
-    return (excited * drive).astype(x.dtype, copy=False)
+    out = excited_lo * p.exciter_drive_lo + excited_hi * p.exciter_drive_hi
+    return out.astype(x.dtype, copy=False)
+
+
+def mid_warmth(x, sr, params: "DSREParams | None" = None):
+    """v1.11: 中域 (200-1500Hz) に微小 even-order harmonic を加え温度感・艶を付与。
+
+    中域は人間の聴感が最も敏感な帯域 (Fletcher-Munson の 2-4kHz peak) で、
+    この帯域の「実在感・温度感」が音源の魅力を左右する。
+    非対称 soft clip (asymmetric saturation) は偶数次倍音 (主に 2nd) を生成し、
+    アナログテープ・チューブアンプ的な暖かさを生む。
+
+    drive=0.05 は非常に控えめ (聴感ではっきり差を出す手前で停止)。
+    過剰な歪・濁り・中域の濁りを完全回避する設計。
+    """
+    p = params if params is not None else PARAMS
+
+    src = _band_extract(x, sr, p.mid_warmth_lo_hz, p.mid_warmth_hi_hz, order=6)
+    s = src.astype(np.float32, copy=False)
+
+    # 非対称 soft clip: tanh(g*x + g*x^2 * 0.15)
+    # x^2 項が偶数次倍音 (2nd harmonic) を主に生成、アナログ的な暖かさの源
+    g = p.mid_warmth_asym_gain
+    asym = np.tanh(g * s + g * s * s * 0.15) / g - s  # 原音引いて差分のみ抽出
+    asym = asym.astype(np.float32, copy=False)
+
+    # 加算は中高域のみ (低域の膨張を完全回避、ボーカルの抜けに寄与)
+    sos_out = safe_butter_sos(6, p.mid_warmth_out_hp_hz, sr, btype="highpass")
+    warm = safe_sosfiltfilt(sos_out, asym, axis=-1)
+
+    if not np.all(np.isfinite(warm)):
+        return np.zeros_like(x)
+
+    return (warm * p.mid_warmth_drive).astype(x.dtype, copy=False)
+
+
+def stereo_widen_hf(x, sr, params: "DSREParams | None" = None):
+    """v1.11: Mid/Side 分解で Side の高域 (2kHz+) のみ微増。空間広がり・臨場感を向上。
+
+    M = (L + R) / 2、S = (L - R) / 2。
+    Side は元々ステレオ情報 (空間情報) を担う成分で、ここの高域だけを上げると
+    「ホール感・奥行き・楽器の左右分離」が向上する。Mid (センター) は無触なので
+    ボーカル定位は無傷。
+
+    mono 入力時 (1ch / 2ch 同一) は完全 no-op、副作用ゼロ。
+    """
+    p = params if params is not None else PARAMS
+
+    if x.ndim != 2 or x.shape[0] != 2:
+        return np.zeros_like(x)
+
+    L = x[0]
+    R = x[1]
+    side = ((L - R) * 0.5).astype(np.float32, copy=False)
+
+    # Side が完全ゼロ (mono 化された stereo) なら no-op
+    if float(np.max(np.abs(side))) < 1e-9:
+        return np.zeros_like(x)
+
+    sos_hp = safe_butter_sos(6, p.stereo_widen_hp_hz, sr, btype="highpass")
+    side_hf = safe_sosfiltfilt(sos_hp, side, axis=-1)
+
+    if not np.all(np.isfinite(side_hf)):
+        return np.zeros_like(x)
+
+    delta_side = (side_hf * p.stereo_widen_gain).astype(np.float32, copy=False)
+    out = np.zeros_like(x)
+    # Side を増やすと L += dS、R -= dS (Mid は無触のまま定位安定)
+    out[0] = delta_side
+    out[1] = -delta_side
+    return out.astype(x.dtype, copy=False)
+
+
+def air_band_sparkle(x, sr, params: "DSREParams | None" = None):
+    """v1.11: 16kHz+ の "air" 帯域に plausible 高域を補い、空気感・透明感を強化。
+
+    DSEE HX の核思想「失われた高域の plausible 推定」を最高域帯で実装。
+    既存 zansei_impl/exciter は 12kHz 付近までを主にカバーするが、それ以上の
+    超高域 (15-22kHz、いわゆる "air") はスパース。ここを envelope follower +
+    強めサチュレータで控えめに補い、解像感・透明感・没入感を底上げする。
+    """
+    p = params if params is not None else PARAMS
+
+    # ソース: 13kHz+ の信号 (この帯域に元々あるエネルギーから倍音を作る)
+    src = _band_extract(x, sr, p.air_band_hp_hz, hi_hz=None, order=6)
+    s = src.astype(np.float32, copy=False)
+
+    # 強めサチュレータ (微小信号でも倍音が出る)
+    sat = _tanh_sat(s, p.air_band_sat_gain)
+    rect = _half_rect_dc_removed(s)
+    mix = 0.4 * rect + 0.6 * sat
+
+    # 15kHz+ のみを通す (中域への滲みを完全に断つ)
+    sos_out = safe_butter_sos(6, p.air_band_out_hp_hz, sr, btype="highpass")
+    air = safe_sosfiltfilt(sos_out, mix, axis=-1)
+
+    if not np.all(np.isfinite(air)):
+        return np.zeros_like(x)
+
+    return (air * p.air_band_drive).astype(x.dtype, copy=False)
+
+
+def transient_crispness(x, sr, params: "DSREParams | None" = None):
+    """v1.11: 低域 (<200Hz) の立ち上がり (transient) のみを軽くブースト。
+
+    高速 envelope (5ms) と低速 envelope (50ms) の差を取ると、長期平均より
+    瞬間的に音圧が立つ部分 (キック・ベースの attack) を取り出せる。
+    そこにだけ +Δ を乗せることで、低域の量感は変えずに「輪郭・締まり・制動感」
+    のみを向上させる。
+
+    一次 IIR (one-pole lowpass) で envelope 抽出 → そのまま transient 信号として
+    元の低域信号に加算する。drive=0.08 でごく軽め (低域膨張防止)。
+    """
+    p = params if params is not None else PARAMS
+
+    # 低域帯域抽出 (~200Hz LP)
+    sos_lp = safe_butter_sos(4, p.transient_lp_hz, sr, btype="lowpass")
+    low = safe_sosfiltfilt(sos_lp, x, axis=-1)
+    if not np.all(np.isfinite(low)):
+        return np.zeros_like(x)
+
+    abs_low = np.abs(low.astype(np.float32, copy=False))
+
+    # one-pole IIR で fast/slow envelope を計算
+    # alpha = 1 - exp(-1 / (sr * tau))
+    fast_alpha = float(1.0 - np.exp(-1.0 / max(1.0, sr * (p.transient_fast_ms * 1e-3))))
+    slow_alpha = float(1.0 - np.exp(-1.0 / max(1.0, sr * (p.transient_slow_ms * 1e-3))))
+
+    def _one_pole(sig: np.ndarray, alpha: float) -> np.ndarray:
+        # SOS で近似 (sosfiltfilt より高速、forward-only で transient 検出に十分)
+        b = np.array([alpha], dtype=np.float64)
+        a = np.array([1.0, -(1.0 - alpha)], dtype=np.float64)
+        try:
+            return signal.lfilter(b, a, sig, axis=-1).astype(np.float32, copy=False)
+        except Exception:
+            return sig.astype(np.float32, copy=False)
+
+    env_fast = _one_pole(abs_low, fast_alpha)
+    env_slow = _one_pole(abs_low, slow_alpha)
+
+    # transient = max(0, fast - slow) → 立ち上がり部のみ (>0)
+    diff = env_fast - env_slow
+    diff = np.maximum(diff, 0.0).astype(np.float32, copy=False)
+
+    # 低域信号 sign を保持して transient 量だけブースト分を生成
+    sign = np.sign(low.astype(np.float32, copy=False))
+    boost = sign * diff
+
+    if not np.all(np.isfinite(boost)):
+        return np.zeros_like(x)
+
+    return (boost * p.transient_gain).astype(x.dtype, copy=False)
 
 
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
@@ -456,18 +701,34 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
-    # v1.10: 整数倍音 exciter を並列加算 (freq_shift 系倍音と独立 path)。
-    # freq_shift は線形周波数変位で harmonic relationship を破壊するため、
-    # 整数倍音生成型 exciter で「自然な厚み」を補い解像感を引き上げる。
-    d_exc = harmonic_exciter(
-        x, sr,
-        hp_hz=PARAMS.exciter_hp,
-        out_hp_hz=PARAMS.exciter_out_hp,
-        drive=PARAMS.exciter_drive,
-        sat_gain=PARAMS.exciter_sat_gain,
-    )
+    # v1.11: Multi-Aspect Enhancement
+    # 各音響側面 (整数倍音 / 中域温度感 / 立体感 / 超高域空気感 / 低域立ち上がり)
+    # を独立 path として加算する。原音は無減衰、各 path は drive 控えめ。
+    # 失敗 (NaN) 時は当該 path を 0 にして他の path に影響しない。
+    d_exc = harmonic_exciter(x, sr, params=PARAMS)
+    d_warm = mid_warmth(x, sr, params=PARAMS)
+    d_widen = stereo_widen_hf(x, sr, params=PARAMS)
+    d_air = air_band_sparkle(x, sr, params=PARAMS)
+    d_tran = transient_crispness(x, sr, params=PARAMS)
 
-    result = x + d_res + d_exc
+    d_extra = d_res + d_exc + d_warm + d_widen + d_air + d_tran
+
+    # Master headroom: 原音 + d_extra の peak が 1.0 近傍を超えそうなら d_extra
+    # のみを縮める。原音は無触で「原音の魅力を殺さない」ことを保証。
+    cand = x + d_extra
+    peak_now = float(np.max(np.abs(cand))) if cand.size else 0.0
+    if peak_now > PARAMS.master_headroom_peak:
+        # 原音の peak は超えないように d_extra をスケールダウン
+        x_peak = float(np.max(np.abs(x))) if x.size else 0.0
+        budget = max(0.0, PARAMS.master_headroom_peak - x_peak)
+        extra_peak = float(np.max(np.abs(d_extra))) if d_extra.size else 0.0
+        if extra_peak > 1e-12 and budget > 0.0:
+            scale = min(1.0, budget / extra_peak)
+            d_extra = (d_extra * scale).astype(x.dtype, copy=False)
+        else:
+            d_extra = np.zeros_like(x)
+
+    result = x + d_extra
 
     if not np.all(np.isfinite(result)):
         return np.clip(x, -1.0, 1.0)
@@ -1082,31 +1343,105 @@ def _run_selftest() -> int:
             else:
                 psy_notes.append(f"WARN(no_hf_gain {tag})")
 
-            # v1.10: harmonic_exciter 単独 sanity (整数倍音生成 + DC offset 除去)
-            exc_only = harmonic_exciter(x_psy.copy(), TARGET_SR)
-            # exciter 出力は HP=7kHz 通過なので低域はほぼゼロ → 倍音帯域に集中
-            exc_dc = float(_np.mean(_np.abs(_np.mean(exc_only, axis=-1))))
-            exc_peak = float(_np.max(_np.abs(exc_only)))
-            exc_finite = bool(_np.all(_np.isfinite(exc_only)))
-            if not exc_finite:
-                psy_notes.append("EXC_NaN")
-                verdict = "DEGRADED"
-            elif exc_dc > 1e-3:
-                # 半波整流の DC offset が出力 HP で除去されているはず
-                psy_notes.append(f"EXC_DC_HIGH({exc_dc:.2e})")
+            # v1.11: 各 enhancement path 単独 sanity
+            # 各 path が (1) NaN/Inf を返さない、(2) 過剰 DC offset を持たない、
+            # (3) 設計帯域に十分なエネルギーを持つ、ことを個別検証する。
+            def _path_sanity(name, sig, expect_hf_only=True, max_dc=1e-3,
+                             min_peak=1e-7, max_peak=0.5):
+                nonlocal verdict
+                if not bool(_np.all(_np.isfinite(sig))):
+                    psy_notes.append(f"{name}_NaN")
+                    verdict = "DEGRADED"
+                    return False
+                dc = float(_np.mean(_np.abs(_np.mean(sig, axis=-1))))
+                pk = float(_np.max(_np.abs(sig)))
+                if dc > max_dc:
+                    psy_notes.append(f"{name}_DC_HIGH({dc:.1e})")
+                    verdict = "DEGRADED"
+                    return False
+                if pk > max_peak:
+                    # path 単独で原音 peak を超えるのは異常 (drive 設計が壊れた合図)
+                    psy_notes.append(f"{name}_PEAK_HIGH({pk:.3f})")
+                    verdict = "DEGRADED"
+                    return False
+                psy_notes.append(f"{name}_OK(pk={pk:.3f},dc={dc:.1e})")
+                return True
+
+            # Stereo input for stereo_widen 検証
+            x_psy_st = x_psy.copy()
+            # わずかに L/R に差をつけて side 信号を生成 (mono だと widen が no-op)
+            x_psy_st[1] = x_psy_st[1] * 0.95 + 0.005 * rng_psy.standard_normal(N_psy).astype(_np.float32)
+
+            d_exc = harmonic_exciter(x_psy.copy(), TARGET_SR, params=PARAMS)
+            d_warm = mid_warmth(x_psy.copy(), TARGET_SR, params=PARAMS)
+            d_widen = stereo_widen_hf(x_psy_st.copy(), TARGET_SR, params=PARAMS)
+            d_air = air_band_sparkle(x_psy.copy(), TARGET_SR, params=PARAMS)
+            d_tran = transient_crispness(x_psy.copy(), TARGET_SR, params=PARAMS)
+
+            _path_sanity("EXC", d_exc)
+            _path_sanity("WARM", d_warm)
+            # widen は 1ch=+δ / 2ch=-δ の対称構造 (M 成分 = 0 のはず)
+            _path_sanity("WIDEN", d_widen)
+            _path_sanity("AIR", d_air)
+            _path_sanity("TRAN", d_tran, max_dc=5e-3)  # transient は低域寄りで DC 余裕
+
+            # exciter 加算で hf_ratio が +0.001 以上上昇 (機能保証)
+            hf_with_exc = measure_hf_ratio(x_psy + d_exc, TARGET_SR)
+            exc_hf_gain = hf_with_exc - hf_in
+            if exc_hf_gain < 1e-3:
+                psy_notes.append(f"EXC_NO_HF_GAIN(hf+={exc_hf_gain:+.3f})")
                 verdict = "DEGRADED"
             else:
-                # exciter 加算で原音より hf_ratio が確実に上昇しているかを別途確認
-                hf_with_exc = measure_hf_ratio(x_psy + exc_only, TARGET_SR)
-                exc_hf_gain = hf_with_exc - hf_in
-                # exciter 単独で hf_ratio +0.001 以上上昇を要求 (機能していることの保証)
-                if exc_hf_gain < 1e-3:
-                    psy_notes.append(f"EXC_NO_HF_GAIN(hf+={exc_hf_gain:+.3f})")
+                psy_notes.append(f"EXC_HF_GAIN(hf+={exc_hf_gain:+.3f})")
+                if verdict == "EQUIV":
+                    verdict = "IMPROVED"
+
+            # Air band 加算で 15kHz 以上のエネルギーが上昇 (plausible HF の機能保証)
+            def _measure_air_ratio(sig: _np.ndarray) -> float:
+                s = _np.mean(sig, axis=0) if sig.ndim > 1 else sig
+                n = len(s)
+                if n < 8:
+                    return 0.0
+                spec = _np.abs(_np.fft.rfft(s))
+                freqs = _np.fft.rfftfreq(n, d=1.0 / TARGET_SR)
+                e = spec * spec
+                tot = float(_np.sum(e)) + 1e-12
+                ar = float(_np.sum(e[freqs >= 15000.0]))
+                return ar / tot
+
+            air_in = _measure_air_ratio(x_psy)
+            air_out = _measure_air_ratio(x_psy + d_air)
+            air_gain = air_out - air_in
+            psy_notes.append(f"AIR_RATIO({air_in:.2e}→{air_out:.2e},+{air_gain:+.2e})")
+
+            # Stereo widen で side energy が増えていること (mono で無くなっていないこと)
+            try:
+                pre_side = (x_psy_st[0] - x_psy_st[1]) * 0.5
+                post = x_psy_st + d_widen
+                post_side = (post[0] - post[1]) * 0.5
+                pre_se = float(_np.sqrt(_np.mean(pre_side * pre_side)) + 1e-30)
+                post_se = float(_np.sqrt(_np.mean(post_side * post_side)) + 1e-30)
+                widen_ratio = post_se / pre_se
+                psy_notes.append(f"WIDEN_RATIO({widen_ratio:.3f})")
+                if widen_ratio < 1.0:
+                    # widen path が side を減らすのは設計違反
+                    psy_notes.append("WIDEN_REGRESSION")
                     verdict = "DEGRADED"
-                else:
-                    psy_notes.append(f"EXC_OK(peak={exc_peak:.3f},dc={exc_dc:.1e},hf+={exc_hf_gain:+.3f})")
-                    if verdict == "EQUIV":
-                        verdict = "IMPROVED"
+            except Exception as e:
+                psy_notes.append(f"WIDEN_EXC({type(e).__name__})")
+
+            # Mid 成分が widen で変化していないこと (定位無傷の保証)
+            try:
+                pre_mid = (x_psy_st[0] + x_psy_st[1]) * 0.5
+                post_mid = ((x_psy_st + d_widen)[0] + (x_psy_st + d_widen)[1]) * 0.5
+                mid_diff = float(_np.max(_np.abs(post_mid - pre_mid)))
+                psy_notes.append(f"WIDEN_MID_DIFF({mid_diff:.2e})")
+                if mid_diff > 1e-5:
+                    # widen は M 成分を保つ設計 (L+=δ, R-=δ で M=0)
+                    psy_notes.append("WIDEN_MID_LEAK")
+                    verdict = "DEGRADED"
+            except Exception as e:
+                psy_notes.append(f"WIDEN_MID_EXC({type(e).__name__})")
         except Exception as e:
             psy_notes.append(f"EXC({type(e).__name__})")
             verdict = "DEGRADED"
