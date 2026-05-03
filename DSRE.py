@@ -26,71 +26,66 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 
 
 # ===== DSP パラメータ =====
-HARMONIC_LAYERS = 8
-HARMONIC_DECAY = 1.25
+# v1.12: 残差倍音層を厚くして「処理価値の客観可視化」を強化
+HARMONIC_LAYERS = 10        # v1.12: 8→10 (層厚増加で解像感・分離感向上)
+HARMONIC_DECAY = 1.10       # v1.12: 1.25→1.10 (上層を活かす、ただし v1.9 失敗教訓 (0.85) は超えない)
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
-POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8: 16k→12k で 12-16kHz 帯域を通す)
-TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
+POST_HP_CUTOFF_HZ = 10000   # v1.12: 12000→10000 (residual の "air" 帯域寄与を拡大)
+TARGET_SR = 96000           # v1.6: 本家デフォルト。192k は intermod 副作用 + 計算 2 倍の overkill (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
 
-# ===== v1.11: Multi-Aspect Enhancement =====
-# 単一倍音生成では「全帯域・全側面の質感向上」に到達しない。
-# 各音響側面 (高域空気感 / 中域温度感 / 立体感 / 低域立ち上がり / 整数倍音) を
-# 独立した低ドライブ加算 path として並列に積層し、合計で控えめに加算する。
-# 原音は無減衰のまま保持 (additive only)、各 path は drive 小さめで副作用を抑える。
+# ===== v1.12: Multi-Aspect Enhancement (Drive 適正化) =====
+# v1.11 では drive 控えめすぎて「処理した意味」が客観・主観の両方で薄かった。
+# v1.12 では各 path の drive を聴感で明確に効果が出るレベルまで引き上げつつ、
+# 刺さり/濁り/位相崩れ を回避するため帯域配置と SAT カーブは v1.11 を踏襲。
+# Master Headroom (0.99) で peak を保護、原音は依然無減衰。
 
-# --- v1.11: Improved Harmonic Exciter (帯域分割 + 偶奇分離) ---
-# 旧 v1.10 の単段 exciter は 4kHz+ 全域を 1 ステージで処理していたため、
-# 高域 (>10kHz) で歪が立ち過ぎ「刺さり」の原因となるリスクがあった。
-# v1.11: 4-10kHz を厚め (温度・実在感)、10kHz+ を薄め (痛さ回避) の 2 段構成。
+# --- v1.12: Improved Harmonic Exciter (drive 引き上げ) ---
+# 4-10kHz は厚みを十分出し (drive 0.28)、10kHz+ は刺さり回避のため drive=0.16。
+# 偶奇比は下段 40/60、上段 30/70 (上段は presence 寄り、温度より sparkle)。
 EXCITER_LO_HZ = 4000        # 下段 exciter ソース下限
-EXCITER_HI_HZ = 10000       # 帯域境界 (下段の上限 / 上段の下限)
+EXCITER_HI_HZ = 9000        # v1.12: 10000→9000 (上段拡張で空気感寄与増)
 EXCITER_OUT_HP_HZ = 6000    # 生成倍音の出力 HP (中域への滲み防止)
-EXCITER_DRIVE_LO = 0.16     # 下段 drive (4-10kHz、厚みを担う)
-EXCITER_DRIVE_HI = 0.10     # 上段 drive (10kHz+、薄め、刺さり回避)
-EXCITER_SAT_GAIN = 1.4      # tanh 入力ゲイン (1.4=soft、1.6 より柔らかく)
-EXCITER_EVEN_RATIO = 0.40   # 偶数倍音 (warmth 寄与) ブレンド比
-EXCITER_ODD_RATIO = 0.60    # 奇数倍音 (presence 寄与) ブレンド比
+EXCITER_DRIVE_LO = 0.28     # v1.12: 0.16→0.28 (温度・実在感を有意に)
+EXCITER_DRIVE_HI = 0.16     # v1.12: 0.10→0.16 (透明感を有意に、刺さり回避は SAT 側で)
+EXCITER_SAT_GAIN = 1.4      # tanh 入力ゲイン (1.4=soft tube-like、刺さり防止)
+EXCITER_EVEN_RATIO = 0.40   # 偶数倍音 (warmth 寄与)
+EXCITER_ODD_RATIO = 0.60    # 奇数倍音 (presence 寄与)
 
-# --- v1.11: Mid Warmth (中域 2nd-harmonic 微加算) ---
-# 200-1500Hz の中域に微小 even-order harmonic を加え、ボーカル・主旋律に
-# 温度感・艶・実在感を与える。drive=0.05 と非常に控えめ (聴感ではっきり差を
-# 出す手前で停止、過剰歪・濁りを完全回避)。
+# --- v1.12: Mid Warmth (drive 引き上げ + SAT 強化) ---
+# v1.11 の drive=0.05 では effective に無音 (selftest WARM_pk=0.0001)。
+# v1.12: drive=0.12 + asym_gain=1.5 で温度感・艶を聴感レベルに引き上げる。
+# 加算帯域は 1.2kHz HP 維持 (低域膨張・濁り完全回避)。
 MID_WARMTH_LO_HZ = 200
-MID_WARMTH_HI_HZ = 1500
-MID_WARMTH_OUT_HP_HZ = 1200  # 加算は中高域のみ (低域の膨張を完全回避)
-MID_WARMTH_DRIVE = 0.05
-MID_WARMTH_ASYM_GAIN = 1.2   # 非対称 soft clip ゲイン (偶数次倍音生成)
+MID_WARMTH_HI_HZ = 1800     # v1.12: 1500→1800 (中高域寄りに拡張、ボーカル子音帯域)
+MID_WARMTH_OUT_HP_HZ = 1200  # 加算は中高域のみ
+MID_WARMTH_DRIVE = 0.12     # v1.12: 0.05→0.12 (聴感レベル)
+MID_WARMTH_ASYM_GAIN = 1.5   # v1.12: 1.2→1.5 (2nd harmonic 生成量を増)
 
-# --- v1.11: Stereo Width HF Enhancement (M/S 処理) ---
-# Mid/Side 分解で Side の 2kHz+ のみを微増し、空間広がり・臨場感を向上。
-# Mid (センター = ボーカル・主旋律) には触らないので定位は無傷。
-# mono 入力時は完全 no-op (副作用ゼロ)。
+# --- v1.12: Stereo Width HF (drive 引き上げ) ---
+# v1.11 の +1.4dB では空間広がりが体感ぎりぎり。
+# v1.12: gain=0.35 (+2.6dB 相当) で立体感・包囲感を有意に。Mid 無触は維持。
 STEREO_WIDEN_HP_HZ = 2000
-STEREO_WIDEN_GAIN = 0.18     # +1.4dB 相当 (Side 高域のみ)
+STEREO_WIDEN_GAIN = 0.35     # v1.12: 0.18→0.35 (Side 高域のみ +2.6dB 相当)
 
-# --- v1.11: Air Band Sparkle (plausible 16kHz+) ---
-# 既存 zansei_impl/exciter は 12kHz 付近までを主にカバーする。
-# 16kHz+ の "air" 帯域を envelope follower + soft sat で控えめに補い、
-# DSEE HX 流の「失われた高域の plausible 推定」を強化。
-AIR_BAND_HP_HZ = 13000       # ソース下限
-AIR_BAND_OUT_HP_HZ = 15000   # 出力 HP (15kHz+ のみ加算)
-AIR_BAND_DRIVE = 0.10
-AIR_BAND_SAT_GAIN = 2.0      # 強めサチュレータ (微小信号でも倍音が出る)
+# --- v1.12: Air Band Sparkle (drive 引き上げ + 帯域拡大) ---
+# v1.11 の AIR_RATIO +1.24e-3 は微小。v1.12: drive=0.20 で plausible HF を有意に。
+AIR_BAND_HP_HZ = 12000       # v1.12: 13000→12000 (ソース帯域を 1kHz 拡大)
+AIR_BAND_OUT_HP_HZ = 14000   # v1.12: 15000→14000 (中域への漏れは 14kHz でカット、十分高い)
+AIR_BAND_DRIVE = 0.20        # v1.12: 0.10→0.20 (空気感を有意に)
+AIR_BAND_SAT_GAIN = 2.2      # v1.12: 2.0→2.2 (微小信号でもしっかり倍音生成)
 
-# --- v1.11: Transient Crispness (低域 attack 強調) ---
-# 200Hz 以下の低域エンベロープから transient (短期 - 長期 envelope の差) を
-# 抽出し、立ち上がり部分にだけごく軽くゲインを乗せる。
-# キック・ベースの輪郭・締まり・制動感を改善 (低域の量感は変えない)。
-TRANSIENT_LP_HZ = 200
-TRANSIENT_FAST_MS = 5.0      # 高速 envelope (~5ms)
-TRANSIENT_SLOW_MS = 50.0     # 低速 envelope (~50ms)
-TRANSIENT_GAIN = 0.08        # 立ち上がり部のブースト量 (控えめ)
+# --- v1.12: Transient Crispness (drive 引き上げ + 帯域拡大) ---
+# v1.11 の TRAN_pk=0.006 は弱め。v1.12: drive=0.18 で attack 立ち上がりを明瞭化。
+# 帯域も 200→260Hz に拡大してキック上倍音・ベースアタックも対象に。
+TRANSIENT_LP_HZ = 260        # v1.12: 200→260 (キック倍音帯域を含める)
+TRANSIENT_FAST_MS = 5.0
+TRANSIENT_SLOW_MS = 50.0
+TRANSIENT_GAIN = 0.18        # v1.12: 0.08→0.18 (立ち上がりを聴感レベルに)
 
-# --- v1.11: Master Headroom (clip 防止) ---
-# 全 path 加算後の peak を測り、1.0 を超えそうなら原音以外を縮める。
-# 原音は無減衰、加算 path のみを比例縮小するので「原音の魅力を殺さない」。
-MASTER_HEADROOM_PEAK = 0.99  # この peak を超えたら d_extra を縮める
+# --- Master Headroom ---
+# 全 path 加算後 peak が 0.99 を超えそうなら d_extra のみ縮小。原音は無減衰。
+MASTER_HEADROOM_PEAK = 0.99
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
 #       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
@@ -1331,17 +1326,23 @@ def _run_selftest() -> int:
             hf_out = measure_hf_ratio(y_psy, TARGET_SR)
 
             tag = f"hf:{hf_in:.3f}→{hf_out:.3f}"
-            # v1.10: hf_ratio 30% 以上上昇で IMPROVED 昇格 (DSEE HX の "失われた高域推定" の核)
-            #        単に > のみなら EQUIV 並に弱い。30% は audible 改善の最小目安
-            HF_GAIN_THRESHOLD = 1.30
+            # v1.12: 50% 以上 hf_ratio 増加を要求 (処理価値の客観可視化を厳格化)
+            #        v1.11 の x1.30 では「処理した意味」が客観的に薄かった
+            HF_GAIN_THRESHOLD = 1.50
+            HF_GAIN_MIN = 1.20  # これ未満は no-op 警告
+            ratio = hf_out / hf_in if hf_in > 1e-6 else 1.0
             if hf_in > 1e-6 and hf_out >= hf_in * HF_GAIN_THRESHOLD:
-                psy_notes.append(f"IMPROVED({tag},×{hf_out/hf_in:.2f})")
+                psy_notes.append(f"IMPROVED({tag},×{ratio:.2f})")
                 if verdict == "EQUIV":
                     verdict = "IMPROVED"
+            elif hf_in > 1e-6 and hf_out >= hf_in * HF_GAIN_MIN:
+                psy_notes.append(f"OK({tag},×{ratio:.2f})")
             elif hf_out > hf_in:
-                psy_notes.append(f"OK({tag})")
+                # 増加はあるが 20% 未満 → 処理価値が薄い (DEGRADED 一歩手前)
+                psy_notes.append(f"WEAK({tag},×{ratio:.2f})")
             else:
                 psy_notes.append(f"WARN(no_hf_gain {tag})")
+                verdict = "DEGRADED"
 
             # v1.11: 各 enhancement path 単独 sanity
             # 各 path が (1) NaN/Inf を返さない、(2) 過剰 DC offset を持たない、
@@ -1412,9 +1413,15 @@ def _run_selftest() -> int:
             air_in = _measure_air_ratio(x_psy)
             air_out = _measure_air_ratio(x_psy + d_air)
             air_gain = air_out - air_in
-            psy_notes.append(f"AIR_RATIO({air_in:.2e}→{air_out:.2e},+{air_gain:+.2e})")
+            # v1.12: Air band path の効果有意性を要求 (+2e-3 以上、処理価値の客観可視化)
+            if air_gain < 2e-3:
+                psy_notes.append(f"AIR_WEAK({air_in:.2e}→{air_out:.2e},+{air_gain:+.2e})")
+            else:
+                psy_notes.append(f"AIR_OK({air_in:.2e}→{air_out:.2e},+{air_gain:+.2e})")
+                if verdict == "EQUIV":
+                    verdict = "IMPROVED"
 
-            # Stereo widen で side energy が増えていること (mono で無くなっていないこと)
+            # Stereo widen で side energy が有意に増えていること
             try:
                 pre_side = (x_psy_st[0] - x_psy_st[1]) * 0.5
                 post = x_psy_st + d_widen
@@ -1422,11 +1429,16 @@ def _run_selftest() -> int:
                 pre_se = float(_np.sqrt(_np.mean(pre_side * pre_side)) + 1e-30)
                 post_se = float(_np.sqrt(_np.mean(post_side * post_side)) + 1e-30)
                 widen_ratio = post_se / pre_se
-                psy_notes.append(f"WIDEN_RATIO({widen_ratio:.3f})")
+                # v1.12: side energy +10% 以上を要求 (空間広がりの客観可視化)
                 if widen_ratio < 1.0:
-                    # widen path が side を減らすのは設計違反
-                    psy_notes.append("WIDEN_REGRESSION")
+                    psy_notes.append(f"WIDEN_REGRESSION({widen_ratio:.3f})")
                     verdict = "DEGRADED"
+                elif widen_ratio < 1.10:
+                    psy_notes.append(f"WIDEN_WEAK({widen_ratio:.3f})")
+                else:
+                    psy_notes.append(f"WIDEN_OK({widen_ratio:.3f})")
+                    if verdict == "EQUIV":
+                        verdict = "IMPROVED"
             except Exception as e:
                 psy_notes.append(f"WIDEN_EXC({type(e).__name__})")
 
