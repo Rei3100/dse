@@ -778,21 +778,13 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
 
     d_extra = d_res + d_exc + d_warm + d_widen + d_air + d_tran + d_nyq
 
-    # Master headroom: 原音 + d_extra の peak が 1.0 近傍を超えそうなら d_extra
-    # のみを縮める。原音は無触で「原音の魅力を殺さない」ことを保証。
-    cand = x + d_extra
-    peak_now = float(np.max(np.abs(cand))) if cand.size else 0.0
-    if peak_now > PARAMS.master_headroom_peak:
-        # 原音の peak は超えないように d_extra をスケールダウン
-        x_peak = float(np.max(np.abs(x))) if x.size else 0.0
-        budget = max(0.0, PARAMS.master_headroom_peak - x_peak)
-        extra_peak = float(np.max(np.abs(d_extra))) if d_extra.size else 0.0
-        if extra_peak > 1e-12 and budget > 0.0:
-            scale = min(1.0, budget / extra_peak)
-            d_extra = (d_extra * scale).astype(x.dtype, copy=False)
-        else:
-            d_extra = np.zeros_like(x)
-
+    # v1.14: Master Headroom 削除 — v1.9.1 / v1.10 同等の純粋加算へ復帰。
+    # Master Headroom (peak > 0.99 で d_extra 縮小) は入力 peak に応じて動的に
+    # 加算量を変える挙動だったため、(1) 説明不能な音量変動、(2) nyq_complement
+    # を含む高域補完エネルギーの縮小、を引き起こしていた。
+    # v1.14 では純粋に `x + d_extra` を返し、最終的な peak > 1.0 の clip 防止は
+    # 下流の save_flac24_out の peak normalization (peak > 1.0 で data / peak)
+    # に委ねる。これは v1.9.1 / v1.10 と同じ音量挙動。
     result = x + d_extra
 
     if not np.all(np.isfinite(result)):
