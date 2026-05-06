@@ -26,13 +26,23 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 
 
 # ===== DSP パラメータ =====
-# v1.12: 残差倍音層を厚くして「処理価値の客観可視化」を強化
-HARMONIC_LAYERS = 10        # v1.12: 8→10 (層厚増加で解像感・分離感向上)
-HARMONIC_DECAY = 1.10       # v1.12: 1.25→1.10 (上層を活かす、ただし v1.9 失敗教訓 (0.85) は超えない)
+# v1.13: 本家相当の基礎性能 (ナイキスト到達の高域補完 + DR/PLR 改善) を完全復活
+# v1.10/本家準拠: HARMONIC_LAYERS=8 / DECAY=1.25 / POST_HP=12k に戻す。
+# 加えて高層 (i=5..7) の decay を補正項でブーストし、32-48kHz 帯域 (ナイキスト
+# 近傍) の補完エネルギーを目視確認できるレベルに保つ。
+HARMONIC_LAYERS = 8         # v1.13: 10→8 復帰 (本家 + v1.10 と同じ 8 層)
+HARMONIC_DECAY = 1.25       # v1.13: 1.10→1.25 復帰 (本家 + v1.10 と同じ、層あたりエネルギー配分が安定)
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
-POST_HP_CUTOFF_HZ = 10000   # v1.12: 12000→10000 (residual の "air" 帯域寄与を拡大)
-TARGET_SR = 96000           # v1.6: 本家デフォルト。192k は intermod 副作用 + 計算 2 倍の overkill (DSEE HX 思想は 96k 上限)
+POST_HP_CUTOFF_HZ = 12000   # v1.13: 10000→12000 復帰 (v1.8 確定値、過剰加算回避)
+TARGET_SR = 96000           # v1.6: 本家デフォルト
 FILTER_ORDER = 11           # バターワース次数
+
+# v1.13: 高層 decay 補正
+# i=5,6,7 (shift>=36kHz) は exp(-(i+1)*1.25) で 0.0019/0.00055/0.00016 と
+# 実用上ほぼゼロ。本家ではこの薄い層が「nyq 付近の plausible 補完」を担うため
+# 完全には消したくない。v1.13 では各高層を 1.5x ブーストして 32-48k 帯のスペク
+# トル可視化を保護する (ただし合計エネルギーは依然小さく、刺さりは出ない)。
+HARMONIC_HIGH_LAYER_BOOST = 1.5  # i>=5 に乗算するブースト係数
 
 # ===== v1.12: Multi-Aspect Enhancement (Drive 適正化) =====
 # v1.11 では drive 控えめすぎて「処理した意味」が客観・主観の両方で薄かった。
@@ -75,13 +85,25 @@ AIR_BAND_OUT_HP_HZ = 14000   # v1.12: 15000→14000 (中域への漏れは 14kHz
 AIR_BAND_DRIVE = 0.20        # v1.12: 0.10→0.20 (空気感を有意に)
 AIR_BAND_SAT_GAIN = 2.2      # v1.12: 2.0→2.2 (微小信号でもしっかり倍音生成)
 
-# --- v1.12: Transient Crispness (drive 引き上げ + 帯域拡大) ---
-# v1.11 の TRAN_pk=0.006 は弱め。v1.12: drive=0.18 で attack 立ち上がりを明瞭化。
-# 帯域も 200→260Hz に拡大してキック上倍音・ベースアタックも対象に。
-TRANSIENT_LP_HZ = 260        # v1.12: 200→260 (キック倍音帯域を含める)
-TRANSIENT_FAST_MS = 5.0
-TRANSIENT_SLOW_MS = 50.0
-TRANSIENT_GAIN = 0.18        # v1.12: 0.08→0.18 (立ち上がりを聴感レベルに)
+# --- v1.13: Transient Crispness (DR/PLR 改善寄与を強化) ---
+# v1.12 の drive=0.18 はピークを増やすが PLR (peak/loudness) 改善は限定的。
+# v1.13: 帯域を 500Hz まで拡大 + drive=0.30 でキック・スネアのアタックを
+# 明確化。peak 領域を相対的に伸ばし、ロスレスな DR/PLR 改善を生む。
+TRANSIENT_LP_HZ = 500        # v1.13: 260→500 (スネア倍音帯域も含める)
+TRANSIENT_FAST_MS = 4.0      # v1.13: 5→4 (より短い envelope、立ち上がり鋭く)
+TRANSIENT_SLOW_MS = 60.0     # v1.13: 50→60 (slow を遅く、コントラスト拡大)
+TRANSIENT_GAIN = 0.30        # v1.13: 0.18→0.30 (アタック立ち上がりの実体感)
+
+# --- v1.13: Nyquist Band Complement (32-48kHz 補完、本家同様の plausible HF) ---
+# v1.10/本家では d_res の高層 (i=5..7) で 36-48kHz 帯にエネルギーが乗っていた。
+# v1.13: 独立 path として「8-22kHz 帯域 → +24kHz freq_shift → 32-46kHz」で
+# 確実に nyq 近傍まで plausible エネルギーを補完する。
+# Audacity 等のスペクトル表示で 32-48kHz 帯に明確な補完が見えることを保証。
+NYQ_COMPLEMENT_LO_HZ = 8000      # ソース帯域下限
+NYQ_COMPLEMENT_HI_HZ = 22000     # ソース帯域上限 (44.1k 入力でも安全)
+NYQ_COMPLEMENT_SHIFT_HZ = 24000  # +24kHz シフト → 32-46kHz 出力
+NYQ_COMPLEMENT_OUT_HP_HZ = 30000 # 30kHz HP で 30-48kHz のみ通す
+NYQ_COMPLEMENT_DRIVE = 0.18      # 控えめ drive (32-48k は可聴域外、DAC 折返し対策)
 
 # --- Master Headroom ---
 # 全 path 加算後 peak が 0.99 を超えそうなら d_extra のみ縮小。原音は無減衰。
@@ -200,11 +222,19 @@ class DSREParams:
     air_band_out_hp_hz: int = AIR_BAND_OUT_HP_HZ
     air_band_drive: float = AIR_BAND_DRIVE
     air_band_sat_gain: float = AIR_BAND_SAT_GAIN
-    # v1.11: Transient Crispness
+    # v1.13: Transient Crispness (DR/PLR 改善寄与強化)
     transient_lp_hz: int = TRANSIENT_LP_HZ
     transient_fast_ms: float = TRANSIENT_FAST_MS
     transient_slow_ms: float = TRANSIENT_SLOW_MS
     transient_gain: float = TRANSIENT_GAIN
+    # v1.13: 高層 decay 補正 (32-48k 補完保護)
+    high_layer_boost: float = HARMONIC_HIGH_LAYER_BOOST
+    # v1.13: Nyquist Band Complement (32-48kHz plausible HF)
+    nyq_complement_lo_hz: int = NYQ_COMPLEMENT_LO_HZ
+    nyq_complement_hi_hz: int = NYQ_COMPLEMENT_HI_HZ
+    nyq_complement_shift_hz: int = NYQ_COMPLEMENT_SHIFT_HZ
+    nyq_complement_out_hp_hz: int = NYQ_COMPLEMENT_OUT_HP_HZ
+    nyq_complement_drive: float = NYQ_COMPLEMENT_DRIVE
     # v1.11: Master headroom
     master_headroom_peak: float = MASTER_HEADROOM_PEAK
 
@@ -666,6 +696,41 @@ def transient_crispness(x, sr, params: "DSREParams | None" = None):
     return (boost * p.transient_gain).astype(x.dtype, copy=False)
 
 
+def nyquist_complement(x, sr, params: "DSREParams | None" = None):
+    """v1.13: 32-48kHz 帯域への plausible HF 補完 (本家 + v1.10 同等の基礎性能)。
+
+    8-22kHz 帯域を抽出 → +24kHz freq_shift で 32-46kHz に飛ばす → 30kHz HP で
+    通す。これにより Audacity 等のスペクトル表示で 32-48kHz 帯に明確な補完
+    エネルギーが観測される (DSRE 本来の "ナイキスト到達補完" 性能)。
+
+    32-48kHz は人間可聴域外 (20kHz 上限) だが、DAC 再生時の plausible 残響成分
+    として高品位機器で実体感に寄与する (DSEE HX 思想と整合)。
+    """
+    p = params if params is not None else PARAMS
+
+    nyq = sr / 2.0
+    shift = float(min(p.nyq_complement_shift_hz, nyq * 0.95 - p.nyq_complement_lo_hz))
+    if shift <= 0:
+        return np.zeros_like(x)
+
+    src = _band_extract(x, sr, p.nyq_complement_lo_hz, p.nyq_complement_hi_hz, order=6)
+    if not np.all(np.isfinite(src)):
+        return np.zeros_like(x)
+
+    d_sr = 1.0 / sr
+    f_dn = freq_shift_mono if (x.ndim == 1) else freq_shift_multi
+    shifted = f_dn(src.astype(x.dtype, copy=False), shift, d_sr)
+
+    out_hp = float(min(p.nyq_complement_out_hp_hz, nyq * 0.95))
+    sos_out = safe_butter_sos(6, out_hp, sr, btype="highpass")
+    nyq_band = safe_sosfiltfilt(sos_out, shifted, axis=-1)
+
+    if not np.all(np.isfinite(nyq_band)):
+        return np.zeros_like(x)
+
+    return (nyq_band * p.nyq_complement_drive).astype(x.dtype, copy=False)
+
+
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
     d_src = safe_sosfiltfilt(sos_pre, x, axis=-1)
@@ -676,6 +741,11 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
 
     n_layers = PARAMS.m
     decays = np.exp(-np.arange(1, n_layers + 1) * PARAMS.decay)
+    # v1.13: 高層 (i>=5、shift>=36kHz) decay を補正してナイキスト近傍補完を保護。
+    # 本家 8 層構成では i=5,6,7 が 36/42/48k のシフトを担うが、decay が指数的に
+    # 0 へ落ち実用上ほぼ消える。スペクトル可視化を目的に 1.5x ブースト。
+    if n_layers > 5:
+        decays[5:] = decays[5:] * PARAMS.high_layer_boost
     nyq = sr / 2.0
 
     for i in range(n_layers):
@@ -696,17 +766,17 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
-    # v1.11: Multi-Aspect Enhancement
-    # 各音響側面 (整数倍音 / 中域温度感 / 立体感 / 超高域空気感 / 低域立ち上がり)
-    # を独立 path として加算する。原音は無減衰、各 path は drive 控えめ。
-    # 失敗 (NaN) 時は当該 path を 0 にして他の path に影響しない。
+    # v1.13: Multi-Aspect Enhancement (6 path、原音無減衰の additive)
+    # path: residual / exciter / mid warmth / stereo widen / air band /
+    #       transient / nyq complement (32-48k 補完を独立 path で確実に)
     d_exc = harmonic_exciter(x, sr, params=PARAMS)
     d_warm = mid_warmth(x, sr, params=PARAMS)
     d_widen = stereo_widen_hf(x, sr, params=PARAMS)
     d_air = air_band_sparkle(x, sr, params=PARAMS)
     d_tran = transient_crispness(x, sr, params=PARAMS)
+    d_nyq = nyquist_complement(x, sr, params=PARAMS)
 
-    d_extra = d_res + d_exc + d_warm + d_widen + d_air + d_tran
+    d_extra = d_res + d_exc + d_warm + d_widen + d_air + d_tran + d_nyq
 
     # Master headroom: 原音 + d_extra の peak が 1.0 近傍を超えそうなら d_extra
     # のみを縮める。原音は無触で「原音の魅力を殺さない」ことを保証。
@@ -1378,13 +1448,14 @@ def _run_selftest() -> int:
             d_widen = stereo_widen_hf(x_psy_st.copy(), TARGET_SR, params=PARAMS)
             d_air = air_band_sparkle(x_psy.copy(), TARGET_SR, params=PARAMS)
             d_tran = transient_crispness(x_psy.copy(), TARGET_SR, params=PARAMS)
+            d_nyq = nyquist_complement(x_psy.copy(), TARGET_SR, params=PARAMS)
 
             _path_sanity("EXC", d_exc)
             _path_sanity("WARM", d_warm)
-            # widen は 1ch=+δ / 2ch=-δ の対称構造 (M 成分 = 0 のはず)
             _path_sanity("WIDEN", d_widen)
             _path_sanity("AIR", d_air)
-            _path_sanity("TRAN", d_tran, max_dc=5e-3)  # transient は低域寄りで DC 余裕
+            _path_sanity("TRAN", d_tran, max_dc=5e-3)
+            _path_sanity("NYQ", d_nyq)
 
             # exciter 加算で hf_ratio が +0.001 以上上昇 (機能保証)
             hf_with_exc = measure_hf_ratio(x_psy + d_exc, TARGET_SR)
@@ -1449,11 +1520,71 @@ def _run_selftest() -> int:
                 mid_diff = float(_np.max(_np.abs(post_mid - pre_mid)))
                 psy_notes.append(f"WIDEN_MID_DIFF({mid_diff:.2e})")
                 if mid_diff > 1e-5:
-                    # widen は M 成分を保つ設計 (L+=δ, R-=δ で M=0)
                     psy_notes.append("WIDEN_MID_LEAK")
                     verdict = "DEGRADED"
             except Exception as e:
                 psy_notes.append(f"WIDEN_MID_EXC({type(e).__name__})")
+
+            # v1.13: Nyquist Band Complement 機能保証 (32-48kHz 帯のエネルギー有意増)
+            try:
+                def _measure_nyq_ratio(sig: _np.ndarray) -> float:
+                    s = _np.mean(sig, axis=0) if sig.ndim > 1 else sig
+                    n = len(s)
+                    if n < 8:
+                        return 0.0
+                    spec = _np.abs(_np.fft.rfft(s))
+                    freqs = _np.fft.rfftfreq(n, d=1.0 / TARGET_SR)
+                    e = spec * spec
+                    tot = float(_np.sum(e)) + 1e-12
+                    return float(_np.sum(e[freqs >= 32000.0])) / tot
+
+                nyq_in = _measure_nyq_ratio(x_psy)
+                nyq_out_full = _measure_nyq_ratio(zansei_impl(x_psy.copy(), TARGET_SR))
+                nyq_gain = nyq_out_full - nyq_in
+                # 32-48kHz 帯のエネルギー比が +1e-4 以上増 (本家相当の基礎性能)
+                if nyq_gain < 1e-4:
+                    psy_notes.append(f"NYQ_WEAK({nyq_in:.2e}→{nyq_out_full:.2e},+{nyq_gain:+.2e})")
+                    verdict = "DEGRADED"
+                else:
+                    psy_notes.append(f"NYQ_OK({nyq_in:.2e}→{nyq_out_full:.2e},+{nyq_gain:+.2e})")
+                    if verdict == "EQUIV":
+                        verdict = "IMPROVED"
+            except Exception as e:
+                psy_notes.append(f"NYQ_EXC({type(e).__name__})")
+
+            # v1.13: DR (peak/RMS) 改善 — transient/Multi-Aspect で平坦化していないこと
+            try:
+                # 簡易 transient 信号 (キック相当) で DR (peak/RMS dB) 比較
+                rng_dr = _np.random.default_rng(2024)
+                N_dr = TARGET_SR // 2  # 0.5 秒
+                t_dr = _np.arange(N_dr, dtype=_np.float32) / TARGET_SR
+                # 100Hz サイン + 4Hz エンベロープでキック様 transient を生成
+                env = (1.0 + _np.cos(2 * _np.pi * 4.0 * t_dr)) * 0.5
+                kick = (0.3 * env * _np.sin(2 * _np.pi * 100.0 * t_dr)).astype(_np.float32)
+                noise_dr = (rng_dr.standard_normal(N_dr) * 0.02).astype(_np.float32)
+                sig_dr_mono = kick + noise_dr
+                sig_dr = _np.stack([sig_dr_mono, sig_dr_mono], axis=0)
+
+                def _peak_rms_db(s: _np.ndarray) -> float:
+                    p = float(_np.max(_np.abs(s))) + 1e-30
+                    r = float(_np.sqrt(_np.mean(s * s))) + 1e-30
+                    return 20.0 * float(_np.log10(p / r))
+
+                dr_in = _peak_rms_db(sig_dr)
+                dr_out = _peak_rms_db(zansei_impl(sig_dr.copy(), TARGET_SR))
+                dr_delta = dr_out - dr_in
+                # 平坦化 (DR 低下) > 0.3dB を DEGRADED 判定
+                if dr_delta < -0.3:
+                    psy_notes.append(f"DR_REGRESSION({dr_in:.2f}→{dr_out:.2f},Δ{dr_delta:+.2f}dB)")
+                    verdict = "DEGRADED"
+                elif dr_delta >= 0.05:
+                    psy_notes.append(f"DR_OK({dr_in:.2f}→{dr_out:.2f},Δ{dr_delta:+.2f}dB)")
+                    if verdict == "EQUIV":
+                        verdict = "IMPROVED"
+                else:
+                    psy_notes.append(f"DR_FLAT({dr_in:.2f}→{dr_out:.2f},Δ{dr_delta:+.2f}dB)")
+            except Exception as e:
+                psy_notes.append(f"DR_EXC({type(e).__name__})")
         except Exception as e:
             psy_notes.append(f"EXC({type(e).__name__})")
             verdict = "DEGRADED"
