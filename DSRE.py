@@ -45,6 +45,36 @@ EXCITER_OUT_HP_HZ = 7000     # 出力 HP (中域への滲み防止)
 EXCITER_DRIVE = 0.20         # 加算ブレンド比 (控えめ、過剰歪回避)
 EXCITER_SAT_GAIN = 1.5       # tanh 入力ゲイン (soft tube-like)
 
+# ===== body 作用: 中低域温度感 (BP 250-1200Hz、出力 LP 3kHz cap) =====
+# 「高域補間ゾーン (7kHz+) へ物理的に届かない」ことを LP カットで保証する設計。
+# 非対称 soft clip で 2nd harmonic 主体の温度感を作る。HP 出力 (旧 mid_warmth) は
+# 飽和高調波が高域へ漏れた失敗、LP 出力でその再発を遮断する。
+BODY_WARMTH_LO_HZ = 250
+BODY_WARMTH_HI_HZ = 1200
+BODY_WARMTH_OUT_LP_HZ = 3000   # 7kHz exciter ゾーンから 4kHz マージン
+BODY_WARMTH_DRIVE = 0.12
+BODY_WARMTH_ASYM_GAIN = 1.2
+BODY_WARMTH_ASYM_K = 0.12       # s² 寄与 (2nd harmonic 強度)
+
+# ===== stereo 作用: 中帯域 Side widening (BP 300-2500Hz、線形、出力 LP 3kHz) =====
+# Mid/Side 中の Side のみ +Δ で空間定義感を上げる。Mid 不変で定位は崩れない。
+# 完全線形 (SAT なし) で harmonic を生成しないため、LP cap で高域補間ゾーンとは
+# 物理的に独立。
+STEREO_DEF_LO_HZ = 300
+STEREO_DEF_HI_HZ = 2500
+STEREO_DEF_OUT_LP_HZ = 3000
+STEREO_DEF_GAIN = 0.15
+
+# ===== sub 作用: <150Hz 輪郭強化 (envelope-based 線形 gain mod、出力 LP 200Hz) =====
+# fast/slow envelope diff を [0,1] 正規化し sub_band 自体に時変ゲインを掛ける。
+# sign() を使わない pure linear (旧 transient_crispness の境界クリック原因を回避)。
+# 出力 LP 200Hz で 200Hz+ には一切影響せず、当然 7kHz+ 高域補間ゾーンも不変。
+SUB_TIGHT_LP_HZ = 150
+SUB_TIGHT_OUT_LP_HZ = 200
+SUB_TIGHT_FAST_MS = 6.0
+SUB_TIGHT_SLOW_MS = 100.0
+SUB_TIGHT_GAIN = 0.10
+
 # ===== dynamics 作用: 入力依存ゲート (v1.18 等価、SAT 残響対策) =====
 # tanh / 半波整流は微小信号でも倍音を生成するため、アウトロ/無音区間で残響と
 # してノイズフロアを上げる。原音 |x| の moving-average envelope が threshold
@@ -148,6 +178,24 @@ class DSREParams:
     exciter_out_hp: int = EXCITER_OUT_HP_HZ
     exciter_drive: float = EXCITER_DRIVE
     exciter_sat_gain: float = EXCITER_SAT_GAIN
+    # body 作用: body_warmth (LP 出力で高域補間ゾーン物理遮断)
+    body_warmth_lo_hz: int = BODY_WARMTH_LO_HZ
+    body_warmth_hi_hz: int = BODY_WARMTH_HI_HZ
+    body_warmth_out_lp_hz: int = BODY_WARMTH_OUT_LP_HZ
+    body_warmth_drive: float = BODY_WARMTH_DRIVE
+    body_warmth_asym_gain: float = BODY_WARMTH_ASYM_GAIN
+    body_warmth_asym_k: float = BODY_WARMTH_ASYM_K
+    # stereo 作用: stereo_definition_mid (中帯域 Side、線形)
+    stereo_def_lo_hz: int = STEREO_DEF_LO_HZ
+    stereo_def_hi_hz: int = STEREO_DEF_HI_HZ
+    stereo_def_out_lp_hz: int = STEREO_DEF_OUT_LP_HZ
+    stereo_def_gain: float = STEREO_DEF_GAIN
+    # sub 作用: sub_tightness (envelope-based 線形 gain mod)
+    sub_tight_lp_hz: int = SUB_TIGHT_LP_HZ
+    sub_tight_out_lp_hz: int = SUB_TIGHT_OUT_LP_HZ
+    sub_tight_fast_ms: float = SUB_TIGHT_FAST_MS
+    sub_tight_slow_ms: float = SUB_TIGHT_SLOW_MS
+    sub_tight_gain: float = SUB_TIGHT_GAIN
     # dynamics 作用: 入力依存ゲート
     input_gate_threshold: float = INPUT_GATE_THRESHOLD
     input_gate_window_ms: float = INPUT_GATE_WINDOW_MS
@@ -414,6 +462,116 @@ def harmonic_exciter(x, sr, params: "DSREParams | None" = None):
     return (excited * p.exciter_drive).astype(x.dtype, copy=False)
 
 
+def _bp_extract(x, sr, lo_hz, hi_hz, order=6):
+    """BP 抽出: HP(lo) → LP(hi) を全て zero-phase sosfiltfilt で。
+    高域補間ゾーンに影響を一切与えない補助 path 用。"""
+    sos_hp = safe_butter_sos(order, lo_hz, sr, btype="highpass")
+    y = safe_sosfiltfilt(sos_hp, x, axis=-1)
+    sos_lp = safe_butter_sos(order, hi_hz, sr, btype="lowpass")
+    y = safe_sosfiltfilt(sos_lp, y, axis=-1)
+    return y
+
+
+def body_warmth(x, sr, params: "DSREParams | None" = None):
+    """中低域 (250-1200Hz) 温度感: 非対称 soft clip による 2nd harmonic 主体。
+
+    旧 mid_warmth が出力 HP=1200 で SAT 高調波を高域に逃した失敗を踏まえ、
+    本実装は出力 **LP=3000Hz** で hard cap し、7kHz+ 高域補間ゾーンへの spillover
+    を Butterworth -90dB/oct 以上で物理的に遮断する。
+
+    流れ:
+      1. BP 250-1200Hz でソース帯域を分離 (中低域)
+      2. asym = tanh(g*s + g*s²*k)/g - s で 2nd harmonic 主体の歪みを作る
+      3. LP=3000Hz で SAT 残響と harmonic spillover を物理遮断
+      4. drive=0.12 でブレンド
+
+    SAT 残響は zansei_impl 末尾の input_gate で除去 (発生源対策の二重化)。
+    """
+    p = params if params is not None else PARAMS
+    src = _bp_extract(x, sr, p.body_warmth_lo_hz, p.body_warmth_hi_hz, order=6)
+    s = src.astype(np.float32, copy=False)
+    g = p.body_warmth_asym_gain
+    k = p.body_warmth_asym_k
+    asym = np.tanh(g * s + g * (s * s) * k) / g - s
+    asym = asym.astype(np.float32, copy=False)
+    sos_out = safe_butter_sos(8, p.body_warmth_out_lp_hz, sr, btype="lowpass")
+    body = safe_sosfiltfilt(sos_out, asym, axis=-1)
+    if not np.all(np.isfinite(body)):
+        return np.zeros_like(x)
+    return (body * p.body_warmth_drive).astype(x.dtype, copy=False)
+
+
+def stereo_definition_mid(x, sr, params: "DSREParams | None" = None):
+    """中帯域 (300-2500Hz) Side のみ +Δ。Mid 不変、完全線形、出力 LP 3kHz cap。
+
+    M/S 分解で Side band を BP 抽出 → LP 出力で hard cap → ±gain で L/R に加減算。
+    Mid (定位の支柱) は触らないため楽器位置が崩れない。SAT を一切使わないため
+    harmonic 生成ゼロ → LP cap と合わせて高域補間ゾーンに物理的に届かない。
+    Mono 入力は完全 no-op。
+    """
+    p = params if params is not None else PARAMS
+    if x.ndim != 2 or x.shape[0] != 2:
+        return np.zeros_like(x)
+    L = x[0]
+    R = x[1]
+    side = ((L - R) * 0.5).astype(np.float32, copy=False)
+    if float(np.max(np.abs(side))) < 1e-9:
+        return np.zeros_like(x)
+    side_bp = _bp_extract(side, sr, p.stereo_def_lo_hz, p.stereo_def_hi_hz, order=6)
+    sos_out = safe_butter_sos(8, p.stereo_def_out_lp_hz, sr, btype="lowpass")
+    side_capped = safe_sosfiltfilt(sos_out, side_bp, axis=-1)
+    if not np.all(np.isfinite(side_capped)):
+        return np.zeros_like(x)
+    delta = (side_capped * p.stereo_def_gain).astype(np.float32, copy=False)
+    out = np.zeros_like(x)
+    out[0] = delta
+    out[1] = -delta
+    return out.astype(x.dtype, copy=False)
+
+
+def sub_tightness(x, sr, params: "DSREParams | None" = None):
+    """<150Hz サブ帯域の輪郭・速度感を envelope-based 線形 gain modulation で強化。
+
+    fast/slow zero-phase moving-average envelope (forward-only IIR を使わない) の
+    diff を [0,1] に正規化 → sub_band 自体に掛けて時変ゲイン。sign() を使わないため
+    境界クリックの再発がない。出力 LP=200Hz cap で 200Hz+ には一切影響せず、
+    当然 7kHz+ 高域補間ゾーンも完全に不変 (-200dB 以上の attenuation)。
+    """
+    p = params if params is not None else PARAMS
+    sos_lp = safe_butter_sos(4, p.sub_tight_lp_hz, sr, btype="lowpass")
+    sub = safe_sosfiltfilt(sos_lp, x, axis=-1)
+    if not np.all(np.isfinite(sub)):
+        return np.zeros_like(x)
+    abs_sub = np.abs(sub.astype(np.float32, copy=False))
+    win_fast = max(1, int(p.sub_tight_fast_ms * sr / 1000.0))
+    win_slow = max(1, int(p.sub_tight_slow_ms * sr / 1000.0))
+    if abs_sub.size < max(win_fast, win_slow) * 2:
+        return np.zeros_like(x)
+    ker_f = np.ones(win_fast, dtype=np.float64) / float(win_fast)
+    ker_s = np.ones(win_slow, dtype=np.float64) / float(win_slow)
+    if abs_sub.ndim > 1:
+        env_fast = np.stack([
+            np.convolve(abs_sub[ch].astype(np.float64), ker_f, mode="same")
+            for ch in range(abs_sub.shape[0])
+        ])
+        env_slow = np.stack([
+            np.convolve(abs_sub[ch].astype(np.float64), ker_s, mode="same")
+            for ch in range(abs_sub.shape[0])
+        ])
+    else:
+        env_fast = np.convolve(abs_sub.astype(np.float64), ker_f, mode="same")
+        env_slow = np.convolve(abs_sub.astype(np.float64), ker_s, mode="same")
+    diff = np.maximum(env_fast - env_slow, 0.0)
+    norm = float(np.percentile(diff, 99.0)) + 1e-9
+    mod = np.clip(diff / norm, 0.0, 1.0).astype(np.float32, copy=False)
+    boost = sub.astype(np.float32, copy=False) * mod
+    sos_out = safe_butter_sos(6, p.sub_tight_out_lp_hz, sr, btype="lowpass")
+    boost_safe = safe_sosfiltfilt(sos_out, boost, axis=-1)
+    if not np.all(np.isfinite(boost_safe)):
+        return np.zeros_like(x)
+    return (boost_safe * p.sub_tight_gain).astype(x.dtype, copy=False)
+
+
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     # 倍音抽出用 pre-HP (3kHz 以上を倍音生成素材に使う、SOS で数値安定化)
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
@@ -448,11 +606,20 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
+    # === 高域補間ゾーン (FROZEN: abf8260 ベースライン、改変禁止) ===
     # harmonic 作用: harmonic_exciter (整数倍音 path、freq_shift 線形変位の補完)
     d_exc = harmonic_exciter(x, sr, params=PARAMS)
 
+    # === 中低域・空間・分離 改善ゾーン (LP cap で高域補間ゾーンと物理隔離) ===
+    # body 作用: 中低域温度感 (250-1200Hz、出力 LP 3kHz、SAT 残響は input_gate 担当)
+    d_body = body_warmth(x, sr, params=PARAMS)
+    # stereo 作用: 中帯域 Side widening (300-2500Hz、線形、Mid 不変)
+    d_stereo = stereo_definition_mid(x, sr, params=PARAMS)
+    # sub 作用: <150Hz 輪郭強化 (envelope 線形 gain mod、出力 LP 200Hz)
+    d_sub = sub_tightness(x, sr, params=PARAMS)
+
     # 加算する補完成分の合計
-    d_extra = d_res + d_exc
+    d_extra = d_res + d_exc + d_body + d_stereo + d_sub
 
     # dynamics 作用: 入力依存ゲート (SAT 残響対策、アウトロ無音区間で d_extra を 0 化)
     # 原音 |x| の moving-average envelope < threshold で d_extra * 0、エッジは zero-phase
