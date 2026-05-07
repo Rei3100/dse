@@ -29,7 +29,9 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 HARMONIC_LAYERS = 8         # 倍音重畳の段数
 HARMONIC_DECAY = 1.25       # 各段の減衰係数
 PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
-POST_HP_CUTOFF_HZ = 16000   # 倍音生成後のハイパス
+# v1.8 復帰: POST_HP 16k→12k で 12-16kHz 帯倍音を開放。v1.8 単独では問題未発生
+# (v1.11 以降の問題は別 path 起因)。再発防止教訓 (feedback_dsre_lessons.md) 参照。
+POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8 復帰)
 TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
