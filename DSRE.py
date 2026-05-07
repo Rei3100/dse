@@ -382,13 +382,11 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
-    adp = float(np.mean(np.abs(d_res)))
-    src = float(np.mean(np.abs(x)))
-
-    eps = 1e-12
-    adj = src / (adp + src + eps)
-
-    result = (x + d_res) * adj
+    # dynamics: auto-gain 削除 (v1.9.1 / v1.14 等価)。
+    # 旧式: result = (x + d_res) * adj は d_res 量に応じて全体 gain が動的に変動するため
+    # 入力ピークごとに音量が説明不能に揺れる挙動を生んでいた。純粋加算へ戻し、最終
+    # peak > 1.0 の clip 防止は save_flac24_out の peak normalization に委ねる。
+    result = x + d_res
     if not np.all(np.isfinite(result)):
         return np.clip(x, -1.0, 1.0)
     return result
