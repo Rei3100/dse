@@ -75,6 +75,38 @@ SUB_TIGHT_FAST_MS = 6.0
 SUB_TIGHT_SLOW_MS = 100.0
 SUB_TIGHT_GAIN = 0.10
 
+# ===== mid_trans 作用: 中帯域 transient 定義感 (250-2500Hz、線形 gain mod) =====
+# fast/slow zero-phase moving-average diff を [0,1] 正規化し mid_band 自体に
+# 時変ゲイン。完全線形 (sign() なし、SAT なし、harmonic 非生成)。
+# 出力 LP 3500Hz cap で 7kHz+ 高域補間ゾーンに物理的に届かない。
+# 効果: アタック明瞭化、楽器立ち上がり、分離感、勢い・生命感。
+MID_TRANS_LO_HZ = 250
+MID_TRANS_HI_HZ = 2500
+MID_TRANS_OUT_LP_HZ = 3500
+MID_TRANS_FAST_MS = 5.0
+MID_TRANS_SLOW_MS = 80.0
+MID_TRANS_GAIN = 0.13
+
+# ===== vocal_pres 作用: ボーカル存在感 (M/S Mid 1500-3000Hz、線形 shelf) =====
+# Mid のみ +Δ、Side 不変。M/S 分解で中帯域 Mid を BP 抽出 → LP cap → +gain。
+# 完全線形・SAT なしのため harmonic 生成ゼロ、LP cap で高域補間ゾーン物理隔離。
+# 効果: ボーカルセンター存在感、台詞・主旋律明瞭化、艶感。
+VOCAL_PRES_LO_HZ = 1500
+VOCAL_PRES_HI_HZ = 3000
+VOCAL_PRES_OUT_LP_HZ = 3500
+VOCAL_PRES_GAIN = 0.10
+
+# ===== low_body 作用: 60-200Hz 胴鳴り感 (asym SAT、出力 LP 400Hz) =====
+# 軽度非対称 soft clip → 2nd harmonic 主体で kick/bass の重みと深さを増す。
+# 出力 LP 400Hz cap で 400Hz+ には影響なし、当然高域補間ゾーン不変。
+# 周波数を上げず体感で増強する psychoacoustic 系手法。
+LOW_BODY_LO_HZ = 60
+LOW_BODY_HI_HZ = 200
+LOW_BODY_OUT_LP_HZ = 400
+LOW_BODY_DRIVE = 0.08
+LOW_BODY_ASYM_GAIN = 1.0
+LOW_BODY_ASYM_K = 0.10
+
 # ===== dynamics 作用: 入力依存ゲート (v1.18 等価、SAT 残響対策) =====
 # tanh / 半波整流は微小信号でも倍音を生成するため、アウトロ/無音区間で残響と
 # してノイズフロアを上げる。原音 |x| の moving-average envelope が threshold
@@ -196,6 +228,25 @@ class DSREParams:
     sub_tight_fast_ms: float = SUB_TIGHT_FAST_MS
     sub_tight_slow_ms: float = SUB_TIGHT_SLOW_MS
     sub_tight_gain: float = SUB_TIGHT_GAIN
+    # mid_trans 作用: mid_transient_def (中帯域 attack 定義、線形)
+    mid_trans_lo_hz: int = MID_TRANS_LO_HZ
+    mid_trans_hi_hz: int = MID_TRANS_HI_HZ
+    mid_trans_out_lp_hz: int = MID_TRANS_OUT_LP_HZ
+    mid_trans_fast_ms: float = MID_TRANS_FAST_MS
+    mid_trans_slow_ms: float = MID_TRANS_SLOW_MS
+    mid_trans_gain: float = MID_TRANS_GAIN
+    # vocal_pres 作用: vocal_presence_mid (M/S Mid 中帯域、線形)
+    vocal_pres_lo_hz: int = VOCAL_PRES_LO_HZ
+    vocal_pres_hi_hz: int = VOCAL_PRES_HI_HZ
+    vocal_pres_out_lp_hz: int = VOCAL_PRES_OUT_LP_HZ
+    vocal_pres_gain: float = VOCAL_PRES_GAIN
+    # low_body 作用: low_body_harmonic (60-200Hz 胴鳴り)
+    low_body_lo_hz: int = LOW_BODY_LO_HZ
+    low_body_hi_hz: int = LOW_BODY_HI_HZ
+    low_body_out_lp_hz: int = LOW_BODY_OUT_LP_HZ
+    low_body_drive: float = LOW_BODY_DRIVE
+    low_body_asym_gain: float = LOW_BODY_ASYM_GAIN
+    low_body_asym_k: float = LOW_BODY_ASYM_K
     # dynamics 作用: 入力依存ゲート
     input_gate_threshold: float = INPUT_GATE_THRESHOLD
     input_gate_window_ms: float = INPUT_GATE_WINDOW_MS
@@ -572,6 +623,104 @@ def sub_tightness(x, sr, params: "DSREParams | None" = None):
     return (boost_safe * p.sub_tight_gain).astype(x.dtype, copy=False)
 
 
+def mid_transient_def(x, sr, params: "DSREParams | None" = None):
+    """中帯域 (250-2500Hz) attack 定義感: 線形 envelope-based gain modulation。
+
+    fast/slow zero-phase moving-average envelope の diff を [0,1] に正規化し
+    mid_band 自体に時変ゲインを掛ける。sign() を使わない pure linear 設計の
+    ため境界クリックが発生しない。SAT を介さないので harmonic を生成せず、
+    出力 LP=3500Hz で 7kHz+ 高域補間ゾーンに物理的に届かない。
+
+    効果: 楽器・ボーカル attack の立ち上がり明瞭化、分離感、勢い・生命感。
+    """
+    p = params if params is not None else PARAMS
+    src = _bp_extract(x, sr, p.mid_trans_lo_hz, p.mid_trans_hi_hz, order=6)
+    if not np.all(np.isfinite(src)):
+        return np.zeros_like(x)
+    abs_src = np.abs(src.astype(np.float32, copy=False))
+    win_fast = max(1, int(p.mid_trans_fast_ms * sr / 1000.0))
+    win_slow = max(1, int(p.mid_trans_slow_ms * sr / 1000.0))
+    if abs_src.size < max(win_fast, win_slow) * 2:
+        return np.zeros_like(x)
+    ker_f = np.ones(win_fast, dtype=np.float64) / float(win_fast)
+    ker_s = np.ones(win_slow, dtype=np.float64) / float(win_slow)
+    if abs_src.ndim > 1:
+        env_f = np.stack([
+            np.convolve(abs_src[ch].astype(np.float64), ker_f, mode="same")
+            for ch in range(abs_src.shape[0])
+        ])
+        env_s = np.stack([
+            np.convolve(abs_src[ch].astype(np.float64), ker_s, mode="same")
+            for ch in range(abs_src.shape[0])
+        ])
+    else:
+        env_f = np.convolve(abs_src.astype(np.float64), ker_f, mode="same")
+        env_s = np.convolve(abs_src.astype(np.float64), ker_s, mode="same")
+    diff = np.maximum(env_f - env_s, 0.0)
+    norm = float(np.percentile(diff, 99.0)) + 1e-9
+    mod = np.clip(diff / norm, 0.0, 1.0).astype(np.float32, copy=False)
+    boost = src.astype(np.float32, copy=False) * mod
+    sos_out = safe_butter_sos(8, p.mid_trans_out_lp_hz, sr, btype="lowpass")
+    boost_safe = safe_sosfiltfilt(sos_out, boost, axis=-1)
+    if not np.all(np.isfinite(boost_safe)):
+        return np.zeros_like(x)
+    return (boost_safe * p.mid_trans_gain).astype(x.dtype, copy=False)
+
+
+def vocal_presence_mid(x, sr, params: "DSREParams | None" = None):
+    """ボーカル存在感: M/S 分解で Mid (=L+R)/2 のみ 1500-3000Hz BP +gentle gain。
+
+    Side 不変なので空間像が崩れず、Mid 中帯域だけがリフトされる → ボーカル
+    センターと主旋律の存在感が増す。完全線形 (SAT なし、harmonic 非生成)、
+    出力 LP=3500Hz で高域補間ゾーン物理隔離。
+    Mono 入力では x 全体に対する BP +gain 等価 (M=x、Side=0)。
+
+    効果: ボーカル存在感、台詞・主旋律明瞭化、こもり改善、艶感。
+    """
+    p = params if params is not None else PARAMS
+    if x.ndim == 2 and x.shape[0] == 2:
+        L = x[0]
+        R = x[1]
+        mid_full = ((L + R) * 0.5).astype(np.float32, copy=False)
+    else:
+        mid_full = x.astype(np.float32, copy=False)
+    mid_band = _bp_extract(mid_full, sr, p.vocal_pres_lo_hz, p.vocal_pres_hi_hz, order=6)
+    sos_out = safe_butter_sos(8, p.vocal_pres_out_lp_hz, sr, btype="lowpass")
+    mid_safe = safe_sosfiltfilt(sos_out, mid_band, axis=-1)
+    if not np.all(np.isfinite(mid_safe)):
+        return np.zeros_like(x)
+    delta_mid = (mid_safe * p.vocal_pres_gain).astype(np.float32, copy=False)
+    if x.ndim == 2 and x.shape[0] == 2:
+        out = np.zeros_like(x)
+        out[0] = delta_mid
+        out[1] = delta_mid
+        return out
+    return delta_mid.astype(x.dtype, copy=False)
+
+
+def low_body_harmonic(x, sr, params: "DSREParams | None" = None):
+    """低域 (60-200Hz) 軽度非対称 soft clip → 2nd harmonic 主体で胴鳴り感。
+
+    asym = tanh(g*s + g*s²*k)/g - s で 120-400Hz 帯に 2nd harmonic を生成し
+    kick/bass を「周波数を上げず」体感で重く深く感じさせる psychoacoustic 系。
+    出力 LP=400Hz cap で 400Hz+ には影響なし、当然 7kHz+ 高域補間ゾーンも不変。
+    SAT 残響は zansei_impl 末尾の input_gate で除去。
+
+    効果: 低域の輪郭・深さ・実在感、kick の存在感、bass の沈み込み。
+    """
+    p = params if params is not None else PARAMS
+    src = _bp_extract(x, sr, p.low_body_lo_hz, p.low_body_hi_hz, order=4)
+    s = src.astype(np.float32, copy=False)
+    g = p.low_body_asym_gain
+    asym = np.tanh(g * s + g * (s * s) * p.low_body_asym_k) / g - s
+    asym = asym.astype(np.float32, copy=False)
+    sos_out = safe_butter_sos(6, p.low_body_out_lp_hz, sr, btype="lowpass")
+    body = safe_sosfiltfilt(sos_out, asym, axis=-1)
+    if not np.all(np.isfinite(body)):
+        return np.zeros_like(x)
+    return (body * p.low_body_drive).astype(x.dtype, copy=False)
+
+
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     # 倍音抽出用 pre-HP (3kHz 以上を倍音生成素材に使う、SOS で数値安定化)
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
@@ -617,9 +766,16 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_stereo = stereo_definition_mid(x, sr, params=PARAMS)
     # sub 作用: <150Hz 輪郭強化 (envelope 線形 gain mod、出力 LP 200Hz)
     d_sub = sub_tightness(x, sr, params=PARAMS)
+    # mid_trans 作用: 中帯域 attack 定義感 (250-2500Hz、線形 gain mod、出力 LP 3.5kHz)
+    d_mid_trans = mid_transient_def(x, sr, params=PARAMS)
+    # vocal_pres 作用: ボーカル存在感 (M/S Mid 1500-3000Hz、線形、出力 LP 3.5kHz)
+    d_vocal = vocal_presence_mid(x, sr, params=PARAMS)
+    # low_body 作用: 60-200Hz 胴鳴り (asym SAT、出力 LP 400Hz)
+    d_low_body = low_body_harmonic(x, sr, params=PARAMS)
 
     # 加算する補完成分の合計
-    d_extra = d_res + d_exc + d_body + d_stereo + d_sub
+    d_extra = (d_res + d_exc + d_body + d_stereo + d_sub
+               + d_mid_trans + d_vocal + d_low_body)
 
     # dynamics 作用: 入力依存ゲート (SAT 残響対策、アウトロ無音区間で d_extra を 0 化)
     # 原音 |x| の moving-average envelope < threshold で d_extra * 0、エッジは zero-phase
