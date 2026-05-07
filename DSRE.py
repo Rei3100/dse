@@ -34,6 +34,24 @@ PRE_HP_CUTOFF_HZ = 3000     # 倍音抽出前のハイパス
 POST_HP_CUTOFF_HZ = 12000   # 倍音生成後のハイパス (v1.8 復帰)
 TARGET_SR = 96000           # v1.6: 本家デフォルトに戻す。192k は intermod 副作用 + 計算 2 倍の overkill だった (DSEE HX 思想は 96k 上限)
 FILTER_ORDER = 11           # バターワース次数
+
+# ===== harmonic 作用: harmonic_exciter (v1.10 等価、整数倍音生成) =====
+# freq_shift 系倍音 (Hilbert + 複素乗算 single-sideband) は線形周波数変位で
+# 整数倍関係 (harmonic relationship) を破壊する → 金属臭さ・不自然な高音乗り。
+# 半波整流 + tanh ソフト歪は f0 から 2f0/3f0 を自然生成し harmonic relationship
+# を保つ。zansei_impl の freq_shift 倍音と独立 path で並列加算する。
+EXCITER_HP_HZ = 4000         # exciter ソース帯域 (4kHz 以上)
+EXCITER_OUT_HP_HZ = 7000     # 出力 HP (中域への滲み防止)
+EXCITER_DRIVE = 0.20         # 加算ブレンド比 (控えめ、過剰歪回避)
+EXCITER_SAT_GAIN = 1.5       # tanh 入力ゲイン (soft tube-like)
+
+# ===== dynamics 作用: 入力依存ゲート (v1.18 等価、SAT 残響対策) =====
+# tanh / 半波整流は微小信号でも倍音を生成するため、アウトロ/無音区間で残響と
+# してノイズフロアを上げる。原音 |x| の moving-average envelope が threshold
+# 未満の区間で d_extra を 0 化する時間領域振幅マスク (FFT 後段矯正ではない)。
+INPUT_GATE_THRESHOLD = 0.003 # -50dBFS、これ未満は無音扱い
+INPUT_GATE_WINDOW_MS = 10.0  # envelope 計測窓
+INPUT_GATE_SMOOTH_HZ = 50.0  # ゲートエッジ zero-phase LP smoothing
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
 #       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
@@ -125,6 +143,15 @@ class DSREParams:
     output_format: str = "FLAC"
     output_subtype: str = "PCM_24"
     output_subtype_fallback: str = "PCM_16"
+    # harmonic 作用: harmonic_exciter
+    exciter_hp: int = EXCITER_HP_HZ
+    exciter_out_hp: int = EXCITER_OUT_HP_HZ
+    exciter_drive: float = EXCITER_DRIVE
+    exciter_sat_gain: float = EXCITER_SAT_GAIN
+    # dynamics 作用: 入力依存ゲート
+    input_gate_threshold: float = INPUT_GATE_THRESHOLD
+    input_gate_window_ms: float = INPUT_GATE_WINDOW_MS
+    input_gate_smooth_hz: float = INPUT_GATE_SMOOTH_HZ
 
 
 PARAMS = DSREParams()
@@ -348,6 +375,45 @@ def safe_sosfiltfilt(sos, x, axis=-1):
     return y
 
 
+def harmonic_exciter(x, sr, params: "DSREParams | None" = None):
+    """harmonic 作用 path (v1.10 等価): 整数倍音生成 (BBE Sonic Maximizer / tube exciter 系)。
+
+    Signal flow:
+      1. HP=hp_hz でソース帯域を分離 (中低域への漏れを断つ)
+      2. 半波整流 + DC offset 除去 → 偶数倍音中心の歪み
+      3. tanh(src * sat_gain) / sat_gain → 奇数倍音 (tube-like soft clip)
+      4. half-rect / tanh を 50/50 ブレンド (偶奇両倍音バランス)
+      5. HP=out_hp_hz で生成倍音の高域成分のみ通過 (中域への滲み防止)
+      6. drive 倍率で zansei_impl の最終加算ステージへ渡す
+
+    forward-only IIR は使わない (`safe_sosfiltfilt` のみ、zero-phase)。
+    """
+    p = params if params is not None else PARAMS
+
+    sos_in = safe_butter_sos(8, p.exciter_hp, sr, btype="highpass")
+    src = safe_sosfiltfilt(sos_in, x, axis=-1)
+    src32 = src.astype(np.float32, copy=False)
+
+    rect = np.maximum(src32, 0.0)
+    if rect.ndim > 1:
+        rect = rect - np.mean(rect, axis=-1, keepdims=True)
+    else:
+        rect = rect - np.mean(rect)
+    rect = rect.astype(np.float32, copy=False)
+
+    sat = (np.tanh(src32 * p.exciter_sat_gain) / p.exciter_sat_gain).astype(np.float32, copy=False)
+
+    mixed = 0.5 * rect + 0.5 * sat
+
+    sos_out = safe_butter_sos(8, p.exciter_out_hp, sr, btype="highpass")
+    excited = safe_sosfiltfilt(sos_out, mixed, axis=-1)
+
+    if not np.all(np.isfinite(excited)):
+        return np.zeros_like(x)
+
+    return (excited * p.exciter_drive).astype(x.dtype, copy=False)
+
+
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     # 倍音抽出用 pre-HP (3kHz 以上を倍音生成素材に使う、SOS で数値安定化)
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
@@ -382,11 +448,35 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     sos_post = safe_butter_sos(PARAMS.filter_order, PARAMS.post_hp, sr, btype="highpass")
     d_res = safe_sosfiltfilt(sos_post, d_res, axis=-1)
 
-    # dynamics: auto-gain 削除 (v1.9.1 / v1.14 等価)。
-    # 旧式: result = (x + d_res) * adj は d_res 量に応じて全体 gain が動的に変動するため
-    # 入力ピークごとに音量が説明不能に揺れる挙動を生んでいた。純粋加算へ戻し、最終
-    # peak > 1.0 の clip 防止は save_flac24_out の peak normalization に委ねる。
-    result = x + d_res
+    # harmonic 作用: harmonic_exciter (整数倍音 path、freq_shift 線形変位の補完)
+    d_exc = harmonic_exciter(x, sr, params=PARAMS)
+
+    # 加算する補完成分の合計
+    d_extra = d_res + d_exc
+
+    # dynamics 作用: 入力依存ゲート (SAT 残響対策、アウトロ無音区間で d_extra を 0 化)
+    # 原音 |x| の moving-average envelope < threshold で d_extra * 0、エッジは zero-phase
+    # LP で滑らか化。FFT 後段矯正ではなく時間領域の振幅マスク (発生源対策)。
+    try:
+        abs_x = np.max(np.abs(x), axis=0) if x.ndim > 1 else np.abs(x)
+        win = max(1, int(PARAMS.input_gate_window_ms * sr / 1000.0))
+        if win > 1 and abs_x.size >= win:
+            kernel = np.ones(win, dtype=np.float64) / float(win)
+            env = np.convolve(abs_x.astype(np.float64), kernel, mode="same")
+            gate = (env >= PARAMS.input_gate_threshold).astype(np.float64)
+            sos_g = safe_butter_sos(2, PARAMS.input_gate_smooth_hz, sr, btype="lowpass")
+            gate_smooth = safe_sosfiltfilt(sos_g, gate, axis=-1)
+            gate_smooth = np.clip(gate_smooth, 0.0, 1.0).astype(x.dtype, copy=False)
+            if x.ndim > 1:
+                d_extra = d_extra * gate_smooth[np.newaxis, :]
+            else:
+                d_extra = d_extra * gate_smooth
+    except Exception:
+        pass
+
+    # dynamics: auto-gain 削除 (v1.9.1 / v1.14 等価) — 純粋加算。clip 防止は
+    # save_flac24_out の peak normalization に委ねる。
+    result = x + d_extra
     if not np.all(np.isfinite(result)):
         return np.clip(x, -1.0, 1.0)
     return result
