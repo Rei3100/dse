@@ -144,17 +144,6 @@ MS_BALANCE_RATIO_CAP = 1.5   # delta Side/Mid ratio ≤ input Side/Mid * 1.5
 PATH_RMS_CAP_RATIO = 0.15    # path RMS ≤ input RMS * 0.15
 PATH_PEAK_CAP_RATIO = 0.18   # path peak ≤ input peak * 0.18
 
-# 改善 J (Round 1, midlow6 合計 dynamic limiter):
-# _path_safety_cap (static, per-path uniform) では捕捉できないジャンル依存の
-# 短期 DR 拡大 (multi_inst/low_bitrate/high_pressure で ΔDR +1〜+3.5dB、9 ジャンル全 ×)
-# を時変 gain で target_ratio に収束。midlow6 合計 (d_body+stereo+sub+mid_trans
-# +vocal+low_body) のみ対象、d_res/d_exc は frozen zone 直接含有のため対象外。
-# moving RMS 比 → 上限超過部のみ scale-down、zero-phase LP で gain smoothing、
-# uniform scaling per sample のため歪み非生成 + preringing 非発生。
-MIDLOW_LIM_TARGET_RATIO = 0.30  # |d_mid|/|x| の moving RMS 上限
-MIDLOW_LIM_WINDOW_MS = 50.0      # moving RMS 窓
-MIDLOW_LIM_SMOOTH_HZ = 30.0      # gain smoothing zero-phase LP cutoff
-
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
 #       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
@@ -298,10 +287,6 @@ class DSREParams:
     ms_balance_ratio_cap: float = MS_BALANCE_RATIO_CAP
     path_rms_cap_ratio: float = PATH_RMS_CAP_RATIO
     path_peak_cap_ratio: float = PATH_PEAK_CAP_RATIO
-    # Round 1: midlow6 合計 dynamic limiter
-    midlow_lim_target_ratio: float = MIDLOW_LIM_TARGET_RATIO
-    midlow_lim_window_ms: float = MIDLOW_LIM_WINDOW_MS
-    midlow_lim_smooth_hz: float = MIDLOW_LIM_SMOOTH_HZ
 
 
 PARAMS = DSREParams()
@@ -887,46 +872,6 @@ def _path_safety_cap(d, rms_x, peak_x,
     return d
 
 
-def _midlow_dynamic_limiter(d_mid, x, sr,
-                            target_ratio=MIDLOW_LIM_TARGET_RATIO,
-                            window_ms=MIDLOW_LIM_WINDOW_MS,
-                            smooth_hz=MIDLOW_LIM_SMOOTH_HZ):
-    """改善 J (Round 1): midlow6 合計に時変 gain を掛け、|d_mid| / |x| の moving RMS 比を
-    target_ratio 以下に抑える。uniform scaling per sample のため歪み非生成 + preringing
-    非発生、d_res/d_exc 凍結ゾーンは対象外 (本関数は呼び出し側で midlow6 合計のみに適用)。
-    """
-    if d_mid.size == 0 or x.size == 0:
-        return d_mid
-    if x.ndim > 1:
-        x_sq = np.mean(x.astype(np.float64) ** 2, axis=0)
-        d_sq = np.mean(d_mid.astype(np.float64) ** 2, axis=0)
-    else:
-        x_sq = x.astype(np.float64) ** 2
-        d_sq = d_mid.astype(np.float64) ** 2
-    sig_len = int(x_sq.shape[-1])
-    # numpy.convolve(mode="same") は max(M, N) 長の出力を返す → kernel size を信号長以下に clamp
-    win = max(1, min(int(window_ms * sr / 1000.0), sig_len))
-    if win <= 1 or sig_len <= 1:
-        return d_mid
-    kernel = np.ones(win, dtype=np.float64) / float(win)
-    rms_x = np.sqrt(np.convolve(x_sq, kernel, mode="same") + 1e-30)
-    rms_d = np.sqrt(np.convolve(d_sq, kernel, mode="same") + 1e-30)
-    target = float(target_ratio)
-    ratio = rms_d / (rms_x + 1e-12)
-    gain = np.where(ratio > target, target / np.maximum(ratio, 1e-12), 1.0)
-    try:
-        sos_g = safe_butter_sos(2, smooth_hz, sr, btype="lowpass")
-        gain = safe_sosfiltfilt(sos_g, gain, axis=-1)
-    except Exception:
-        pass
-    gain = np.clip(gain, 0.0, 1.0)
-    if d_mid.ndim > 1:
-        out = d_mid * gain[np.newaxis, :]
-    else:
-        out = d_mid * gain
-    return out.astype(d_mid.dtype, copy=False)
-
-
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     # 倍音抽出用 pre-HP (3kHz 以上を倍音生成素材に使う、SOS で数値安定化)
     sos_pre = safe_butter_sos(PARAMS.filter_order, PARAMS.pre_hp, sr, btype="highpass")
@@ -996,19 +941,9 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_vocal = _path_safety_cap(d_vocal, rms_x, peak_x, **cap_kw)
     d_low_body = _path_safety_cap(d_low_body, rms_x, peak_x, **cap_kw)
 
-    # === 改善 J (Round 1): midlow6 合計に時変 dynamic limiter ===
-    # ジャンル依存の短期 DR 拡大 (9 ジャンル全 ×、ΔDR +1〜+3.5dB) を target_ratio に
-    # 収束させる。midlow6 合計のみ対象、d_res/d_exc は frozen zone 直接含有のため非関与。
-    d_midlow_sum = d_body + d_stereo + d_sub + d_mid_trans + d_vocal + d_low_body
-    d_midlow_sum = _midlow_dynamic_limiter(
-        d_midlow_sum, x, sr,
-        target_ratio=PARAMS.midlow_lim_target_ratio,
-        window_ms=PARAMS.midlow_lim_window_ms,
-        smooth_hz=PARAMS.midlow_lim_smooth_hz,
-    )
-
     # 加算する補完成分の合計 (d_res / d_exc は凍結出力のまま、改変なし)
-    d_extra = d_res + d_exc + d_midlow_sum
+    d_extra = (d_res + d_exc + d_body + d_stereo + d_sub
+               + d_mid_trans + d_vocal + d_low_body)
 
     # dynamics 作用: 入力依存ゲート (SAT 残響対策、アウトロ無音区間で d_extra を 0 化)
     # 原音 |x| の moving-average envelope < threshold で d_extra * 0、エッジは zero-phase
