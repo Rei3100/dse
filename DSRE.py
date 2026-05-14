@@ -114,36 +114,6 @@ LOW_BODY_ASYM_K = 0.10
 INPUT_GATE_THRESHOLD = 0.003 # -50dBFS、これ未満は無音扱い
 INPUT_GATE_WINDOW_MS = 10.0  # envelope 計測窓
 INPUT_GATE_SMOOTH_HZ = 50.0  # ゲートエッジ zero-phase LP smoothing
-
-# ===== Phase 3 改善: 中低域 6 path 構造的安全弁 =====
-# 高域補間ゾーン (residual harmonic loop / harmonic_exciter / post_hp / input_gate)
-# は abf8260 凍結で改変禁止。以下は中低域 6 path にのみ適用される構造的安全弁。
-#
-# 改善 A (倍音構造): body_warmth / low_body_harmonic の SAT → 純 quadratic 化
-#   tanh ベース歪は 2nd だけでなく 3rd/5th も混入し中低域を dirty にする。
-#   `(s² - mean(s²)) * k` は純 2nd harmonic のみ生成、3rd 以上の混入を排除。
-#
-# 改善 C (動的 envelope): sub_tightness / mid_transient_def の percentile を移動窓化
-#   ファイル全長 percentile_99 は長尺曲後半に強い transient がある場合、前半飽和
-#   後半抑制で前後不均衡 envelope mod を生む。5 秒移動窓 (50% overlap) + 線形補間で
-#   局所的な「loud level」に追従。
-ENV_P99_WINDOW_SEC = 5.0     # 移動 percentile 窓長
-ENV_P99_HOP_RATIO = 0.5      # 50% overlap
-
-# 改善 D (空間 M/S 統合): stereo_definition_mid + vocal_presence_mid の比率正規化
-#   両 path 独立加算で Side+Mid 両方が増強され、トータル M/S バランスが破綻する
-#   素材があるため、入力素材の自然な Side/Mid 比に対する「上限倍率」を設定し
-#   超えた場合のみ d_stereo を線形 scale-down。
-MS_BALANCE_RATIO_CAP = 1.5   # delta Side/Mid ratio ≤ input Side/Mid * 1.5
-
-# 改善 E (RMS cap) + I (peak limit): 中低域 6 path のみ対象、d_res / d_exc は対象外
-#   静的 cap で「上限超過時のみ線形 scale-down」、通常素材では no-op。
-#   uniform scaling のため per-sample 歪み非生成、preringing も非発生。
-#   d_res / d_exc は 高域補間凍結ゾーンに直接含まれるため対象外
-#   (cap でも縮小すれば高域出力が変わるため変更禁止)。
-PATH_RMS_CAP_RATIO = 0.15    # path RMS ≤ input RMS * 0.15
-PATH_PEAK_CAP_RATIO = 0.18   # path peak ≤ input peak * 0.18
-
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
 #       v1.5 の 192k 出力 → 主観違和感 (ボーカル裏に高音乗り) + 計算 2 倍 → v1.6 で 96k 復帰
@@ -277,16 +247,10 @@ class DSREParams:
     low_body_drive: float = LOW_BODY_DRIVE
     low_body_asym_gain: float = LOW_BODY_ASYM_GAIN
     low_body_asym_k: float = LOW_BODY_ASYM_K
-    # dynamics 作用: 入力依存ゲート (FROZEN)
+    # dynamics 作用: 入力依存ゲート
     input_gate_threshold: float = INPUT_GATE_THRESHOLD
     input_gate_window_ms: float = INPUT_GATE_WINDOW_MS
     input_gate_smooth_hz: float = INPUT_GATE_SMOOTH_HZ
-    # Phase 3 改善: 中低域 6 path 構造的安全弁
-    env_p99_window_sec: float = ENV_P99_WINDOW_SEC
-    env_p99_hop_ratio: float = ENV_P99_HOP_RATIO
-    ms_balance_ratio_cap: float = MS_BALANCE_RATIO_CAP
-    path_rms_cap_ratio: float = PATH_RMS_CAP_RATIO
-    path_peak_cap_ratio: float = PATH_PEAK_CAP_RATIO
 
 
 PARAMS = DSREParams()
@@ -560,26 +524,27 @@ def _bp_extract(x, sr, lo_hz, hi_hz, order=6):
 
 
 def body_warmth(x, sr, params: "DSREParams | None" = None):
-    """中低域 (250-1200Hz) 温度感: 純 quadratic による 2nd harmonic 単独生成。
+    """中低域 (250-1200Hz) 温度感: 非対称 soft clip による 2nd harmonic 主体。
 
-    Phase 3 改善 A: 旧 `tanh(g*s + g*s²*k)/g - s` は 2nd 主体狙いだったが
-    tanh 由来の 3rd/5th 奇数倍音が混入し、low_body_harmonic との重畳で 60-400Hz 帯
-    歪み係数の二重加算 + 中低域 dirty 化が発生していた (Phase 1 問題 #3, #4)。
-    純 `(s² - mean(s²)) * k` 化により 2nd 単独生成、3rd 以上の混入をゼロ化。
-    DC 除去で sub-Hz envelope の漏れも防止。
+    旧 mid_warmth が出力 HP=1200 で SAT 高調波を高域に逃した失敗を踏まえ、
+    本実装は出力 **LP=3000Hz** で hard cap し、7kHz+ 高域補間ゾーンへの spillover
+    を Butterworth -90dB/oct 以上で物理的に遮断する。
 
-    出力 **LP=3000Hz** で 7kHz+ 高域補間ゾーンへの spillover を物理遮断する設計は維持。
-    SAT 残響は zansei_impl 末尾の input_gate (FROZEN) で除去 (発生源対策の二重化)。
+    流れ:
+      1. BP 250-1200Hz でソース帯域を分離 (中低域)
+      2. asym = tanh(g*s + g*s²*k)/g - s で 2nd harmonic 主体の歪みを作る
+      3. LP=3000Hz で SAT 残響と harmonic spillover を物理遮断
+      4. drive=0.12 でブレンド
+
+    SAT 残響は zansei_impl 末尾の input_gate で除去 (発生源対策の二重化)。
     """
     p = params if params is not None else PARAMS
     src = _bp_extract(x, sr, p.body_warmth_lo_hz, p.body_warmth_hi_hz, order=6)
     s = src.astype(np.float32, copy=False)
-    s2 = (s * s).astype(np.float32, copy=False)
-    if s2.ndim > 1:
-        s2_mean = np.mean(s2, axis=-1, keepdims=True)
-    else:
-        s2_mean = np.float32(np.mean(s2))
-    asym = ((s2 - s2_mean) * np.float32(p.body_warmth_asym_k)).astype(np.float32, copy=False)
+    g = p.body_warmth_asym_gain
+    k = p.body_warmth_asym_k
+    asym = np.tanh(g * s + g * (s * s) * k) / g - s
+    asym = asym.astype(np.float32, copy=False)
     sos_out = safe_butter_sos(8, p.body_warmth_out_lp_hz, sr, btype="lowpass")
     body = safe_sosfiltfilt(sos_out, asym, axis=-1)
     if not np.all(np.isfinite(body)):
@@ -648,11 +613,7 @@ def sub_tightness(x, sr, params: "DSREParams | None" = None):
         env_fast = np.convolve(abs_sub.astype(np.float64), ker_f, mode="same")
         env_slow = np.convolve(abs_sub.astype(np.float64), ker_s, mode="same")
     diff = np.maximum(env_fast - env_slow, 0.0)
-    # Phase 3 改善 C: ファイル全長 percentile_99 → 5 秒移動窓 99-percentile
-    # 長尺曲後半に強い transient がある場合の前半飽和・後半抑制を回避
-    norm = _moving_p99_norm(diff, sr,
-                            win_sec=p.env_p99_window_sec,
-                            hop_ratio=p.env_p99_hop_ratio)
+    norm = float(np.percentile(diff, 99.0)) + 1e-9
     mod = np.clip(diff / norm, 0.0, 1.0).astype(np.float32, copy=False)
     boost = sub.astype(np.float32, copy=False) * mod
     sos_out = safe_butter_sos(6, p.sub_tight_out_lp_hz, sr, btype="lowpass")
@@ -696,10 +657,7 @@ def mid_transient_def(x, sr, params: "DSREParams | None" = None):
         env_f = np.convolve(abs_src.astype(np.float64), ker_f, mode="same")
         env_s = np.convolve(abs_src.astype(np.float64), ker_s, mode="same")
     diff = np.maximum(env_f - env_s, 0.0)
-    # Phase 3 改善 C: ファイル全長 percentile_99 → 5 秒移動窓 99-percentile
-    norm = _moving_p99_norm(diff, sr,
-                            win_sec=p.env_p99_window_sec,
-                            hop_ratio=p.env_p99_hop_ratio)
+    norm = float(np.percentile(diff, 99.0)) + 1e-9
     mod = np.clip(diff / norm, 0.0, 1.0).astype(np.float32, copy=False)
     boost = src.astype(np.float32, copy=False) * mod
     sos_out = safe_butter_sos(8, p.mid_trans_out_lp_hz, sr, btype="lowpass")
@@ -741,135 +699,26 @@ def vocal_presence_mid(x, sr, params: "DSREParams | None" = None):
 
 
 def low_body_harmonic(x, sr, params: "DSREParams | None" = None):
-    """低域 (60-200Hz) 純 quadratic で 2nd harmonic 単独生成、胴鳴り感。
+    """低域 (60-200Hz) 軽度非対称 soft clip → 2nd harmonic 主体で胴鳴り感。
 
-    Phase 3 改善 A: 旧 tanh ベースは 3rd 以上の奇数倍音を 60-200Hz 帯に混入させ
-    body_warmth との重畳で歪み二重加算を起こしていた。純 quadratic 化で 2nd 単独
-    生成、3rd 以上の混入をゼロ化。kick/bass を「周波数を上げず」体感で重く深く
-    感じさせる psychoacoustic 系の意図はそのまま。
-
-    出力 LP=400Hz cap で 400Hz+ には影響なし、7kHz+ 高域補間ゾーンも不変。
-    SAT 残響は zansei_impl 末尾の input_gate (FROZEN) で除去。
+    asym = tanh(g*s + g*s²*k)/g - s で 120-400Hz 帯に 2nd harmonic を生成し
+    kick/bass を「周波数を上げず」体感で重く深く感じさせる psychoacoustic 系。
+    出力 LP=400Hz cap で 400Hz+ には影響なし、当然 7kHz+ 高域補間ゾーンも不変。
+    SAT 残響は zansei_impl 末尾の input_gate で除去。
 
     効果: 低域の輪郭・深さ・実在感、kick の存在感、bass の沈み込み。
     """
     p = params if params is not None else PARAMS
     src = _bp_extract(x, sr, p.low_body_lo_hz, p.low_body_hi_hz, order=4)
     s = src.astype(np.float32, copy=False)
-    s2 = (s * s).astype(np.float32, copy=False)
-    if s2.ndim > 1:
-        s2_mean = np.mean(s2, axis=-1, keepdims=True)
-    else:
-        s2_mean = np.float32(np.mean(s2))
-    asym = ((s2 - s2_mean) * np.float32(p.low_body_asym_k)).astype(np.float32, copy=False)
+    g = p.low_body_asym_gain
+    asym = np.tanh(g * s + g * (s * s) * p.low_body_asym_k) / g - s
+    asym = asym.astype(np.float32, copy=False)
     sos_out = safe_butter_sos(6, p.low_body_out_lp_hz, sr, btype="lowpass")
     body = safe_sosfiltfilt(sos_out, asym, axis=-1)
     if not np.all(np.isfinite(body)):
         return np.zeros_like(x)
     return (body * p.low_body_drive).astype(x.dtype, copy=False)
-
-
-# ===== Phase 3 改善ヘルパー (中低域 6 path 専用、高域補間ゾーン非関与) =====
-
-def _moving_p99_norm(diff, sr, win_sec=ENV_P99_WINDOW_SEC, hop_ratio=ENV_P99_HOP_RATIO):
-    """改善 C: 移動窓 99-percentile による envelope 動的正規化。
-
-    ファイル全長 percentile_99 は長尺曲で前半飽和・後半抑制を起こす。本関数は
-    `win_sec` 秒のブロックごとに 99-percentile を計算し、線形補間で全サンプル長に
-    展開する。50% overlap で隣接ブロック境界の段差を avoid。
-    短尺信号 (2 窓未満) では従来の static percentile にフォールバック。
-    """
-    if diff.ndim > 1:
-        return np.stack([
-            _moving_p99_norm(diff[ch], sr, win_sec, hop_ratio)
-            for ch in range(diff.shape[0])
-        ])
-    n = diff.size
-    win = max(1, int(win_sec * sr))
-    if n <= 2 * win:
-        return np.full(n, float(np.percentile(diff, 99.0)) + 1e-9, dtype=np.float64)
-    hop = max(1, int(win * hop_ratio))
-    centers: list[float] = []
-    p99s: list[float] = []
-    pos = 0
-    while pos < n:
-        end = min(pos + win, n)
-        block = diff[pos:end]
-        if block.size > 0:
-            centers.append(0.5 * (pos + end - 1))
-            p99s.append(float(np.percentile(block, 99.0)))
-        if end >= n:
-            break
-        pos += hop
-    centers_arr = np.asarray(centers, dtype=np.float64)
-    p99s_arr = np.asarray(p99s, dtype=np.float64) + 1e-9
-    return np.interp(np.arange(n, dtype=np.float64), centers_arr, p99s_arr)
-
-
-def _ms_balance_correction(d_stereo, d_vocal, x, ratio_cap=MS_BALANCE_RATIO_CAP):
-    """改善 D: stereo_def + vocal_pres の合成 M/S 比率を入力素材の自然比に従わせる。
-
-    両 path 独立加算で Side+Mid 両方を増強する現状は、ジャズ live のような元 Side が
-    大きい素材で左右ピンポン化リスクを生む。本関数は入力 x の Side/Mid RMS 比に対し
-    delta 側の Side/Mid 比が `ratio_cap` 倍を超えた場合のみ d_stereo を線形 scale-down。
-    通常素材では no-op、Mono 入力もスルー。
-    """
-    if x.ndim != 2 or x.shape[0] != 2:
-        return d_stereo, d_vocal
-    if not (isinstance(d_stereo, np.ndarray) and d_stereo.ndim == 2):
-        return d_stereo, d_vocal
-    if not (isinstance(d_vocal, np.ndarray) and d_vocal.ndim == 2):
-        return d_stereo, d_vocal
-
-    def _rms(arr: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)) + 1e-12)
-
-    x_mid = (x[0] + x[1]) * 0.5
-    x_side = (x[0] - x[1]) * 0.5
-    rms_x_mid = _rms(x_mid)
-    rms_x_side = _rms(x_side)
-    target_ratio = rms_x_side / rms_x_mid
-
-    d_mid_combined = (d_stereo[0] + d_stereo[1] + d_vocal[0] + d_vocal[1]) * 0.5
-    d_side_combined = (d_stereo[0] - d_stereo[1] + d_vocal[0] - d_vocal[1]) * 0.5
-    rms_d_mid = _rms(d_mid_combined)
-    rms_d_side = _rms(d_side_combined)
-    if rms_d_mid < 1e-9 or rms_d_side < 1e-9:
-        return d_stereo, d_vocal
-    delta_ratio = rms_d_side / rms_d_mid
-
-    ratio_max = max(target_ratio * ratio_cap, 1e-6)
-    if delta_ratio > ratio_max:
-        scale = ratio_max / delta_ratio
-        d_stereo = (d_stereo * scale).astype(d_stereo.dtype, copy=False)
-    return d_stereo, d_vocal
-
-
-def _path_safety_cap(d, rms_x, peak_x,
-                     rms_cap=PATH_RMS_CAP_RATIO, peak_cap=PATH_PEAK_CAP_RATIO):
-    """改善 E + I: 中低域 path 1 つに対する RMS / peak 上限 cap (uniform scale-down)。
-
-    path RMS が入力 RMS * `rms_cap` を超える、または path peak が入力 peak * `peak_cap`
-    を超える場合のみ線形 scale-down (両 cap の min を採用)。通常素材では no-op、
-    uniform scaling のため per-sample 歪み非発生、preringing 非生成。
-    本 cap は中低域 6 path 専用。d_res / d_exc は abf8260 凍結ゾーンに直接含まれる
-    ため適用対象外 (cap でも縮小すれば高域出力が変わるため変更禁止)。
-    """
-    if d.size == 0:
-        return d
-    abs_d = np.abs(d)
-    peak = float(np.max(abs_d))
-    rms = float(np.sqrt(np.mean(d.astype(np.float64) ** 2))) + 1e-12
-    if rms_x <= 0.0 or peak_x <= 0.0:
-        return d
-    rms_max = rms_cap * rms_x
-    peak_max = peak_cap * peak_x
-    scale_rms = (rms_max / rms) if rms > rms_max else 1.0
-    scale_peak = (peak_max / peak) if peak > peak_max and peak > 0 else 1.0
-    scale = min(scale_rms, scale_peak)
-    if scale < 1.0:
-        return (d * scale).astype(d.dtype, copy=False)
-    return d
 
 
 def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
@@ -921,27 +770,10 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_mid_trans = mid_transient_def(x, sr, params=PARAMS)
     # vocal_pres 作用: ボーカル存在感 (M/S Mid 1500-3000Hz、線形、出力 LP 3.5kHz)
     d_vocal = vocal_presence_mid(x, sr, params=PARAMS)
-    # low_body 作用: 60-200Hz 胴鳴り (純 quadratic 2nd、出力 LP 400Hz)
+    # low_body 作用: 60-200Hz 胴鳴り (asym SAT、出力 LP 400Hz)
     d_low_body = low_body_harmonic(x, sr, params=PARAMS)
 
-    # === Phase 3 改善: 中低域 6 path 構造的安全弁 (高域補間ゾーン非関与) ===
-    # 改善 D: stereo_def + vocal_pres の合成 M/S 比率を入力素材の自然比に従わせる
-    d_stereo, d_vocal = _ms_balance_correction(
-        d_stereo, d_vocal, x, ratio_cap=PARAMS.ms_balance_ratio_cap
-    )
-    # 改善 E + I: 中低域 6 path のみに RMS / peak cap (uniform scale-down、通常 no-op)
-    # d_res / d_exc は abf8260 凍結ゾーン直接含有のため対象外
-    rms_x = float(np.sqrt(np.mean(x.astype(np.float64) ** 2))) + 1e-12
-    peak_x = float(np.max(np.abs(x))) + 1e-12
-    cap_kw = dict(rms_cap=PARAMS.path_rms_cap_ratio, peak_cap=PARAMS.path_peak_cap_ratio)
-    d_body = _path_safety_cap(d_body, rms_x, peak_x, **cap_kw)
-    d_stereo = _path_safety_cap(d_stereo, rms_x, peak_x, **cap_kw)
-    d_sub = _path_safety_cap(d_sub, rms_x, peak_x, **cap_kw)
-    d_mid_trans = _path_safety_cap(d_mid_trans, rms_x, peak_x, **cap_kw)
-    d_vocal = _path_safety_cap(d_vocal, rms_x, peak_x, **cap_kw)
-    d_low_body = _path_safety_cap(d_low_body, rms_x, peak_x, **cap_kw)
-
-    # 加算する補完成分の合計 (d_res / d_exc は凍結出力のまま、改変なし)
+    # 加算する補完成分の合計
     d_extra = (d_res + d_exc + d_body + d_stereo + d_sub
                + d_mid_trans + d_vocal + d_low_body)
 
