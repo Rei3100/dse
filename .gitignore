@@ -9,3 +9,4 @@ release/
 build-manifest.txt
 *.spec
 !DSRE.spec
+dsre.db

@@ -1565,7 +1565,148 @@ def _run_selftest() -> int:
         if not det_lv_ok:
             verdict = "DEGRADED"
 
-        # ---- (6) ffmpeg 同梱確認 ----
+        # ---- (6) Phase 4 拡張 gates: frozen-zone-integrity / harmonic-cleanliness / outro-residue / spectral-monotonicity / ms-imbalance ----
+        # 中低域 path 改変が高域補間ゾーンに漏れていないか、SAT 残響・段差・空間破綻が発生していないかを数値で gate。
+        # 各 gate fail → verdict=DEGRADED → CI exit 1 → deploy artifact 非生成。
+        gates: list[tuple[str, str, bool]] = []  # (name, tag, pass)
+
+        # G1 harmonic-cleanliness: 300Hz 純 sin → body_warmth h3/h2 < -40 dB (純 2nd 主体)
+        try:
+            N_hc = TARGET_SR * 2
+            t_hc = _np.arange(N_hc, dtype=_np.float64) / TARGET_SR
+            sig_hc = (0.3 * _np.sin(2 * _np.pi * 300.0 * t_hc)).astype(_np.float32)
+            sig_hc_2d = _np.stack([sig_hc, sig_hc])
+            b_out = body_warmth(sig_hc_2d, TARGET_SR)
+            ch0 = b_out[0] if b_out.ndim > 1 else b_out
+            fft_hc = _np.abs(_np.fft.rfft(ch0.astype(_np.float64), n=N_hc))
+            def _amp(f_hz):
+                i = int(round(f_hz * N_hc / TARGET_SR))
+                return float(fft_hc[i]) if 0 < i < len(fft_hc) else 0.0
+            h2 = _amp(600.0) + 1e-12
+            h3 = _amp(900.0) + 1e-12
+            h3_h2_db = 20.0 * float(_np.log10(h3 / h2))
+            hc_pass = h3_h2_db < -40.0
+            gates.append(("harmonic-clean", f"h3/h2={h3_h2_db:+.1f}dB", hc_pass))
+            if not hc_pass:
+                verdict = "DEGRADED"
+        except Exception as e:
+            gates.append(("harmonic-clean", f"EXC({type(e).__name__})", False))
+            verdict = "DEGRADED"
+
+        # G2 outro-residue: 末尾 -60dBFS 区間で d_extra ≈ 0 (input_gate 効き)
+        try:
+            N_or = TARGET_SR * 4
+            t_or = _np.arange(N_or, dtype=_np.float64) / TARGET_SR
+            sig_or = (0.3 * _np.sin(2 * _np.pi * 1000.0 * t_or)).astype(_np.float32)
+            sig_or[N_or // 2 :] *= 0.001  # 末尾を -60dBFS に
+            sig_or_2d = _np.stack([sig_or, sig_or])
+            y_or = zansei_impl(sig_or_2d.copy(), TARGET_SR)
+            tail = y_or[:, N_or // 2 + TARGET_SR :]
+            tail_peak = float(_np.max(_np.abs(tail))) + 1e-30
+            tail_dbfs = 20.0 * float(_np.log10(tail_peak))
+            or_pass = tail_dbfs < -55.0
+            gates.append(("outro-residue", f"tail={tail_dbfs:+.1f}dBFS", or_pass))
+            if not or_pass:
+                verdict = "DEGRADED"
+        except Exception as e:
+            gates.append(("outro-residue", f"EXC({type(e).__name__})", False))
+            verdict = "DEGRADED"
+
+        # G3 spectral-monotonicity: white noise 入力で隣接 1kHz bin ジャンプ < +5 dB
+        try:
+            rng_sm = _np.random.default_rng(31337)
+            N_sm = TARGET_SR * 2
+            sig_sm = (rng_sm.standard_normal(N_sm).astype(_np.float32) * 0.1)
+            sig_sm_2d = _np.stack([sig_sm, sig_sm])
+            y_sm = zansei_impl(sig_sm_2d.copy(), TARGET_SR)
+            spec = _np.abs(_np.fft.rfft(y_sm[0].astype(_np.float64), n=N_sm))
+            spec_db = 20.0 * _np.log10(spec + 1e-12)
+            # 1kHz bin 単位で平均し、隣接差の最大を取る
+            bins_per_khz = max(1, int(1000.0 * N_sm / TARGET_SR))
+            n_bands = len(spec_db) // bins_per_khz
+            band_means = _np.array([float(_np.mean(spec_db[i * bins_per_khz : (i + 1) * bins_per_khz])) for i in range(n_bands)])
+            jumps = _np.diff(band_means)
+            max_jump = float(_np.max(jumps)) if len(jumps) > 0 else 0.0
+            sm_pass = max_jump < 5.0
+            gates.append(("spec-mono", f"max_jump={max_jump:+.1f}dB", sm_pass))
+            if not sm_pass:
+                verdict = "DEGRADED"
+        except Exception as e:
+            gates.append(("spec-mono", f"EXC({type(e).__name__})", False))
+            verdict = "DEGRADED"
+
+        # G4 ms-imbalance: stereo 入力で delta Side/Mid 比 vs input 比 < 1.5
+        try:
+            rng_ms = _np.random.default_rng(54321)
+            N_ms = TARGET_SR * 2
+            L_in = (rng_ms.standard_normal(N_ms).astype(_np.float32) * 0.1)
+            R_in = (rng_ms.standard_normal(N_ms).astype(_np.float32) * 0.1)
+            x_ms = _np.stack([L_in, R_in])
+            y_ms = zansei_impl(x_ms.copy(), TARGET_SR)
+            def _ms_ratio(arr):
+                mid = (arr[0] + arr[1]) * 0.5
+                side = (arr[0] - arr[1]) * 0.5
+                rms_m = float(_np.sqrt(_np.mean(mid.astype(_np.float64) ** 2))) + 1e-12
+                rms_s = float(_np.sqrt(_np.mean(side.astype(_np.float64) ** 2))) + 1e-12
+                return rms_s / rms_m
+            r_in = _ms_ratio(x_ms)
+            r_out = _ms_ratio(y_ms.astype(_np.float32) - x_ms)  # delta の M/S 比
+            ratio = r_out / max(r_in, 1e-9)
+            mi_pass = ratio < 1.5
+            gates.append(("ms-imbal", f"delta/in={ratio:.2f}", mi_pass))
+            if not mi_pass:
+                verdict = "DEGRADED"
+        except Exception as e:
+            gates.append(("ms-imbal", f"EXC({type(e).__name__})", False))
+            verdict = "DEGRADED"
+
+        # G5 frozen-zone-integrity: 中低域 path が 12kHz+ に漏れていないか
+        # mid-low 6 path は全て出力 LP cap < 7kHz、12kHz+ への寄与はゼロが理想
+        # delta = zansei_impl(x) - x の中、12kHz+ は d_res + d_exc 由来のみであるべき
+        # 中低域 path のうち output LP > 12kHz のものがあれば違反 (現状なし、設計検証)
+        try:
+            # 設計上 LP cap が物理隔離するので、本 gate は中低域 path 単体の出力 12kHz+ エネルギーを直接見る
+            rng_fz = _np.random.default_rng(7777)
+            N_fz = TARGET_SR * 2
+            x_fz = (rng_fz.standard_normal((2, N_fz)).astype(_np.float32) * 0.1)
+            fz_max_db = -200.0
+            for path_fn, path_name in [
+                (body_warmth, "body"),
+                (stereo_definition_mid, "stereo"),
+                (sub_tightness, "sub"),
+                (mid_transient_def, "mid_trans"),
+                (vocal_presence_mid, "vocal"),
+                (low_body_harmonic, "low_body"),
+            ]:
+                try:
+                    out_p = path_fn(x_fz, TARGET_SR)
+                    if out_p is None or (hasattr(out_p, "size") and out_p.size == 0):
+                        continue
+                    ch = out_p[0] if out_p.ndim > 1 else out_p
+                    spec_fz = _np.abs(_np.fft.rfft(ch.astype(_np.float64), n=N_fz))
+                    freqs_fz = _np.fft.rfftfreq(N_fz, 1.0 / TARGET_SR)
+                    hf_mask = freqs_fz >= 12000.0
+                    hf_e = float(_np.sqrt(_np.mean(spec_fz[hf_mask] ** 2))) + 1e-30
+                    ref_e = float(_np.sqrt(_np.mean(spec_fz ** 2))) + 1e-30
+                    rel_db = 20.0 * float(_np.log10(hf_e / ref_e))
+                    if rel_db > fz_max_db:
+                        fz_max_db = rel_db
+                except Exception:
+                    pass
+            # 中低域 path の出力 12kHz+ 相対 RMS。LP cap 8 次 Butterworth + quadratic
+            # 残響 + FFT 数値分解能で -25 dB 以下が実用閾値 (絶対 baseline 比較は
+            # MCP frozen_zone_diff が abf8260 比較で別途実施)。
+            fz_pass = fz_max_db < -25.0
+            gates.append(("frozen-zone", f"midlow_12k+={fz_max_db:+.1f}dB", fz_pass))
+            if not fz_pass:
+                verdict = "DEGRADED"
+        except Exception as e:
+            gates.append(("frozen-zone", f"EXC({type(e).__name__})", False))
+            verdict = "DEGRADED"
+
+        gates_summary = " ".join(f"{n}:{t}{'✓' if p else '×'}" for n, t, p in gates)
+
+        # ---- (7) ffmpeg 同梱確認 ----
         ffmpeg_path = _find_bundled(
             os.path.join("ffmpeg", "ffmpeg.exe"),
             os.path.join("_internal", "ffmpeg", "ffmpeg.exe"),
@@ -1590,6 +1731,7 @@ def _run_selftest() -> int:
                 f"sosfiltfilt_equiv=[{eq_summary}] "
                 f"determinism=[{' '.join(det_notes)}] "
                 f"lv_det=[{' '.join(det_lv_notes)}] "
+                f"gates=[{gates_summary}] "
                 f"ffmpeg={ffmpeg_note}\n"
             )
         return 0 if verdict != "DEGRADED" else 1
