@@ -141,13 +141,8 @@ MS_BALANCE_RATIO_CAP = 1.5   # delta Side/Mid ratio ≤ input Side/Mid * 1.5
 #   uniform scaling のため per-sample 歪み非生成、preringing も非発生。
 #   d_res / d_exc は 高域補間凍結ゾーンに直接含まれるため対象外
 #   (cap でも縮小すれば高域出力が変わるため変更禁止)。
-PATH_RMS_CAP_RATIO = 0.10    # path RMS ≤ input RMS * 0.10 (Round 2: 0.15→0.10)
-PATH_PEAK_CAP_RATIO = 0.12   # path peak ≤ input peak * 0.12 (Round 2: 0.18→0.12)
-# Round 2 根拠: 9 ジャンル ΔDR × の主因は d_extra (=d_res+d_exc+midlow6) peak 加算。
-# d_res/d_exc は凍結ゾーンで触れないため、midlow6 寄与を path level で厳しく抑え、
-# 結果 peak を下げ DR を input に近づける。midlow path 単体 12kHz+ は LP cap で物理
-# 隔離されており、cap 値変更は frozen zone 出力に非関与 (uniform per-path scale-down)。
-# 副次: Phase 3 quality pass の subjective 過剰仮説への対処 (5f91f5e rollback_log)。
+PATH_RMS_CAP_RATIO = 0.15    # path RMS ≤ input RMS * 0.15
+PATH_PEAK_CAP_RATIO = 0.18   # path peak ≤ input peak * 0.18
 
 # v1.6: FLAC 96kHz / PCM_24 固定 (v1.5 の WAV 32bit float / 192kHz は overkill だった)
 # 経緯: v1.4 で WAV 32bit float 化 → foobar 測定で v1.3 と同値 → v1.5 で FLAC PCM_24 復帰
