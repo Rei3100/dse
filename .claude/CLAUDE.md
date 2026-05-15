@@ -24,7 +24,7 @@
 4. **`run_hidden` は `CREATE_NO_WINDOW` 単独で使う** (STARTUPINFO は不要、yt-dlp GUI v17.2 と揃える)
 5. **Windows subprocess**: 必ず `creationflags=CREATE_NO_WINDOW`、コマンドプロンプトをポップさせない
 6. **INPUT_DIR / OUTPUT_DIR はハードコード維持** (個人ワークフローで固定、UI から変更させない方針)
-7. **新機能は plan → 承認 → 実装**。plan 冒頭に Claude Code 育成 9 項目テーブルを付けること
+7. **新機能は plan → 承認 → 実装** (重大破壊変更のみ。育成 9 項目テーブル義務は Phase 3 環境再設計で撤廃)
 8. **出力フォーマット FLAC 96kHz / PCM_24 固定** (v1.6 確定)。**sr / bit / layer 数等の品質パラメータを上げる前に「3 問チェック (利益/不足/重量)」+ 主観 A/B 必要性自問の両方が必要**。32bit 化 (v1.4) と 192k 化 (v1.5) は数値テストでは検出できない副作用を持っていた
 
 ## 音響処理改善ルール (v1.5 改訂)

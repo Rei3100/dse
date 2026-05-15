@@ -10,3 +10,7 @@ build-manifest.txt
 *.spec
 !DSRE.spec
 dsre.db
+
+# DSRE env runtime state (Phase 3 compact persistence)
+dsre_tools/baseline.json
+dsre_tools/rollback.log
