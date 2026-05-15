@@ -107,6 +107,17 @@ LOW_BODY_DRIVE = 0.08
 LOW_BODY_ASYM_GAIN = 1.0
 LOW_BODY_ASYM_K = 0.10
 
+# ===== Phase3 cycle2 bold basket (2026-05-16、各独立 flag、耳 NG 時 cheap gate で bisect) =====
+# spectral_ledge 源 = 帯域配置/重なり (急峻度でない: C1/cand1 で falsified 済)。
+# A/B/C を帯域・cap の「配置」変更で攻める。全て出力 LP ≤3.5kHz 維持 → 7kHz+ 凍結非到達。
+BP_REALIGN_ENABLED = True        # A: body/mid_trans を 800Hz で tile (250-1200 二重計上除去)
+BODY_WARMTH_HI_HZ_R = 800        # A: body_warmth hi 1200→800
+MID_TRANS_LO_HZ_R = 800          # A: mid_transient_def lo 250→800 (body と境界共有)
+MS_ROLE_SPLIT_ENABLED = True     # B: stereo_def Side を 300-1500 に限定 (vocal Mid 1500-3000 と非重複)
+STEREO_DEF_HI_HZ_R = 1500        # B: stereo_def hi 2500→1500
+CAP_ALIGN_ENABLED = True         # C: midlow 出力 LP cap を 3500 に統一 (3000/3500 二重端除去)
+MIDLOW_UNIFIED_OUT_LP_HZ = 3500  # C: body/stereo 出力 LP 3000→3500 (≤3.5k 維持、凍結非到達)
+
 # ===== dynamics 作用: 入力依存ゲート (v1.18 等価、SAT 残響対策) =====
 # tanh / 半波整流は微小信号でも倍音を生成するため、アウトロ/無音区間で残響と
 # してノイズフロアを上げる。原音 |x| の moving-average envelope が threshold
@@ -287,6 +298,14 @@ class DSREParams:
     ms_balance_ratio_cap: float = MS_BALANCE_RATIO_CAP
     path_rms_cap_ratio: float = PATH_RMS_CAP_RATIO
     path_peak_cap_ratio: float = PATH_PEAK_CAP_RATIO
+    # Phase3 cycle2 bold basket (各独立 flag、bisect 可能)
+    bp_realign_enabled: bool = BP_REALIGN_ENABLED
+    body_warmth_hi_hz_r: int = BODY_WARMTH_HI_HZ_R
+    mid_trans_lo_hz_r: int = MID_TRANS_LO_HZ_R
+    ms_role_split_enabled: bool = MS_ROLE_SPLIT_ENABLED
+    stereo_def_hi_hz_r: int = STEREO_DEF_HI_HZ_R
+    cap_align_enabled: bool = CAP_ALIGN_ENABLED
+    midlow_unified_out_lp_hz: int = MIDLOW_UNIFIED_OUT_LP_HZ
 
 
 PARAMS = DSREParams()
@@ -572,7 +591,8 @@ def body_warmth(x, sr, params: "DSREParams | None" = None):
     SAT 残響は zansei_impl 末尾の input_gate (FROZEN) で除去 (発生源対策の二重化)。
     """
     p = params if params is not None else PARAMS
-    src = _bp_extract(x, sr, p.body_warmth_lo_hz, p.body_warmth_hi_hz, order=6)
+    _hi = p.body_warmth_hi_hz_r if p.bp_realign_enabled else p.body_warmth_hi_hz  # A
+    src = _bp_extract(x, sr, p.body_warmth_lo_hz, _hi, order=6)
     s = src.astype(np.float32, copy=False)
     s2 = (s * s).astype(np.float32, copy=False)
     if s2.ndim > 1:
@@ -580,7 +600,8 @@ def body_warmth(x, sr, params: "DSREParams | None" = None):
     else:
         s2_mean = np.float32(np.mean(s2))
     asym = ((s2 - s2_mean) * np.float32(p.body_warmth_asym_k)).astype(np.float32, copy=False)
-    sos_out = safe_butter_sos(8, p.body_warmth_out_lp_hz, sr, btype="lowpass")
+    _olp = p.midlow_unified_out_lp_hz if p.cap_align_enabled else p.body_warmth_out_lp_hz  # C
+    sos_out = safe_butter_sos(8, _olp, sr, btype="lowpass")
     body = safe_sosfiltfilt(sos_out, asym, axis=-1)
     if not np.all(np.isfinite(body)):
         return np.zeros_like(x)
@@ -603,8 +624,10 @@ def stereo_definition_mid(x, sr, params: "DSREParams | None" = None):
     side = ((L - R) * 0.5).astype(np.float32, copy=False)
     if float(np.max(np.abs(side))) < 1e-9:
         return np.zeros_like(x)
-    side_bp = _bp_extract(side, sr, p.stereo_def_lo_hz, p.stereo_def_hi_hz, order=6)
-    sos_out = safe_butter_sos(8, p.stereo_def_out_lp_hz, sr, btype="lowpass")
+    _shi = p.stereo_def_hi_hz_r if p.ms_role_split_enabled else p.stereo_def_hi_hz  # B
+    side_bp = _bp_extract(side, sr, p.stereo_def_lo_hz, _shi, order=6)
+    _solp = p.midlow_unified_out_lp_hz if p.cap_align_enabled else p.stereo_def_out_lp_hz  # C
+    sos_out = safe_butter_sos(8, _solp, sr, btype="lowpass")
     side_capped = safe_sosfiltfilt(sos_out, side_bp, axis=-1)
     if not np.all(np.isfinite(side_capped)):
         return np.zeros_like(x)
@@ -673,7 +696,8 @@ def mid_transient_def(x, sr, params: "DSREParams | None" = None):
     効果: 楽器・ボーカル attack の立ち上がり明瞭化、分離感、勢い・生命感。
     """
     p = params if params is not None else PARAMS
-    src = _bp_extract(x, sr, p.mid_trans_lo_hz, p.mid_trans_hi_hz, order=6)
+    _lo = p.mid_trans_lo_hz_r if p.bp_realign_enabled else p.mid_trans_lo_hz  # A
+    src = _bp_extract(x, sr, _lo, p.mid_trans_hi_hz, order=6)
     if not np.all(np.isfinite(src)):
         return np.zeros_like(x)
     abs_src = np.abs(src.astype(np.float32, copy=False))
