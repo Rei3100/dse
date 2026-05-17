@@ -128,6 +128,8 @@ MIDLOW_UNIFIED_OUT_LP_HZ = 3500  # C: body/stereo 出力 LP 3000→3500 (≤3.5k
 # A: 整数比 (48k→96k=×2 / 192k→96k=÷2 等) のみ scipy resample_poly + 設計 kaiser、
 #   非整数比 (44.1k/88.2k) は現 resampy kaiser_best fallback で不変。env DSRE_INT_RESAMPLE=1。
 # 源間 spread の構造上限 = [MIN,MAX] 幅 (±10% → 最悪 spread 0.20、Phase2 acceptance を数式に内包)。
+PROFILE_SCALE_ENABLED = True     # P+Q: 採用済 (2026-05-18 耳 OK)。既定 ON、
+#   env DSRE_PROFILE_SCALE=0 が kill-switch (bisect/debug 用)。1/未設定=ON。
 PROFILE_SCALE_MIN = 0.90         # Q: 非凍結合算スケール下限
 PROFILE_SCALE_MAX = 1.10         # Q: 上限 (±10%、源間 spread を構造的に ≤0.20 へ)
 PROFILE_CREST_REF_DB = 12.0      # Q: crest 基準 (≥=広DR→中立、未満=海苔→減衰のみ)
@@ -375,7 +377,8 @@ class DSREParams:
     stereo_def_hi_hz_r: int = STEREO_DEF_HI_HZ_R
     cap_align_enabled: bool = CAP_ALIGN_ENABLED
     midlow_unified_out_lp_hz: int = MIDLOW_UNIFIED_OUT_LP_HZ
-    # Phase3 cycle3 input-adaptive (env flag 制御、default 定数 = identity 寄り)
+    # Phase3 cycle3 input-adaptive (採用済、既定 ON、env=0 で kill-switch)
+    profile_scale_enabled: bool = PROFILE_SCALE_ENABLED
     profile_scale_min: float = PROFILE_SCALE_MIN
     profile_scale_max: float = PROFILE_SCALE_MAX
     profile_crest_ref_db: float = PROFILE_CREST_REF_DB
@@ -1056,10 +1059,11 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_low_body = _path_safety_cap(d_low_body, rms_x, peak_x, **cap_kw)
 
     # === Phase3 cycle3: 入力源特性に対する非凍結 6 path の bounded 連続スケール ===
-    # env DSRE_PROFILE_SCALE=1 のときのみ発火。未設定なら下記 if を完全スキップし
-    # 従来式と byte 同一。凍結 d_res / d_exc はスケール対象外 (後段で無改変加算)
-    # のため HF signature は入力非依存・abf8260 凍結不変。
-    if os.environ.get("DSRE_PROFILE_SCALE") == "1":
+    # 採用済 (耳 OK) のため既定 ON。env DSRE_PROFILE_SCALE=0 のみ kill-switch
+    # として無効化 (bisect/debug)。OFF 時は下記 if を完全スキップし従来式と byte
+    # 同一。凍結 d_res / d_exc はスケール対象外 (後段で無改変加算) のため HF
+    # signature は入力非依存・abf8260 凍結不変。
+    if PARAMS.profile_scale_enabled and os.environ.get("DSRE_PROFILE_SCALE") != "0":
         try:
             crest_db = 20.0 * np.log10(peak_x / rms_x) if rms_x > 0 else 0.0
             mono = x if x.ndim == 1 else x.mean(axis=0)
