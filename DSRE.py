@@ -6,14 +6,16 @@ import time
 import tempfile
 import subprocess
 import configparser
+import functools
 from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
 from scipy import signal
 from scipy.fft import next_fast_len
-import librosa
-import resampy
+# librosa / resampy は遅延 import (使用箇所で import)。
+# numba/llvmlite JIT を GUI 起動経路から外し体感起動を短縮する。
+# librosa: load_audio_safe フォールバック時のみ。resampy: 非 96k 入力のリサンプル時のみ。
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -374,23 +376,27 @@ def load_audio_safe(path):
     except (RuntimeError, OSError, ValueError):
         pass
     try:
+        import librosa  # 遅延 import: soundfile 成功時は numba/llvmlite を読み込まない
         y, sr = librosa.load(path, mono=False, sr=None, dtype=np.float32)
         if y.ndim == 1:
             y = y[np.newaxis, :]
         return y, sr
     except Exception as e:
-        raise RuntimeError(f"読み込み失敗: {path}") from e
+        raise RuntimeError(f"読み込み失敗: {path} ({type(e).__name__}: {e})") from e
 
 
 # ===== 保存 (v1.6: 96kHz / FLAC PCM_24 + ffmpeg -c copy でメタデータ継承) =====
 def _try_sf_write(path, data, sr, subtype, fmt):
-    """書込 → 読み直しで shape / sr が一致するかをラウンドトリップ検証する。
+    """書込 → ヘッダ検証で sr / frame 数 / channel 数の一致を確認する。
+    旧実装はファイル全体を再デコードしていた。libsndfile の STREAMINFO を読む
+    sf.info で truncated / 形状不一致は同等に検出でき、96kHz/24bit FLAC の
+    全サンプル再読み込み (重い I/O+CPU) を毎ファイル省ける。出力バイトは不変。
     失敗時は中途半端に残ったファイルを削除して False を返す。"""
     try:
         sf.write(path, data, sr, subtype=subtype, format=fmt)
-        check, check_sr = sf.read(path, always_2d=True, dtype="float32")
-        if check_sr != sr or check.shape != data.shape:
-            raise RuntimeError("roundtrip mismatch")
+        info = sf.info(path)
+        if info.samplerate != sr or (info.frames, info.channels) != tuple(data.shape):
+            raise RuntimeError("write verification mismatch")
         return True
     except Exception:
         try:
@@ -502,6 +508,11 @@ def freq_shift_multi(x, f_shift, d_sr):
     return (S * F[np.newaxis, :])[:, :N].real
 
 
+# sr は実行中不変 (96kHz 固定)、order/cutoff も定数由来で組合せは ~20 種。
+# 設計係数を毎ファイル多数回再計算していたのを lru_cache で初回のみに。
+# 返り値は read-only 共用 (sosfiltfilt は sos を変更しない) で bit 完全同一、
+# functools.lru_cache は CPython でスレッドセーフ。
+@functools.lru_cache(maxsize=None)
 def safe_butter_sos(order, cutoff_hz, sr, btype="highpass"):
     """SOS (Second-Order Sections) 形式で Butterworth を構築する。
     高次 IIR (本プロジェクトでは order=11) で ba 係数がアンダーフロー / ピボット
@@ -658,18 +669,19 @@ def sub_tightness(x, sr, params: "DSREParams | None" = None):
         return np.zeros_like(x)
     ker_f = np.ones(win_fast, dtype=np.float64) / float(win_fast)
     ker_s = np.ones(win_slow, dtype=np.float64) / float(win_slow)
-    if abs_sub.ndim > 1:
+    abs_sub64 = abs_sub.astype(np.float64)  # float32→float64 は無損失、巻き上げで重複キャスト除去
+    if abs_sub64.ndim > 1:
         env_fast = np.stack([
-            np.convolve(abs_sub[ch].astype(np.float64), ker_f, mode="same")
-            for ch in range(abs_sub.shape[0])
+            np.convolve(abs_sub64[ch], ker_f, mode="same")
+            for ch in range(abs_sub64.shape[0])
         ])
         env_slow = np.stack([
-            np.convolve(abs_sub[ch].astype(np.float64), ker_s, mode="same")
-            for ch in range(abs_sub.shape[0])
+            np.convolve(abs_sub64[ch], ker_s, mode="same")
+            for ch in range(abs_sub64.shape[0])
         ])
     else:
-        env_fast = np.convolve(abs_sub.astype(np.float64), ker_f, mode="same")
-        env_slow = np.convolve(abs_sub.astype(np.float64), ker_s, mode="same")
+        env_fast = np.convolve(abs_sub64, ker_f, mode="same")
+        env_slow = np.convolve(abs_sub64, ker_s, mode="same")
     diff = np.maximum(env_fast - env_slow, 0.0)
     # Phase 3 改善 C: ファイル全長 percentile_99 → 5 秒移動窓 99-percentile
     # 長尺曲後半に強い transient がある場合の前半飽和・後半抑制を回避
@@ -707,18 +719,19 @@ def mid_transient_def(x, sr, params: "DSREParams | None" = None):
         return np.zeros_like(x)
     ker_f = np.ones(win_fast, dtype=np.float64) / float(win_fast)
     ker_s = np.ones(win_slow, dtype=np.float64) / float(win_slow)
-    if abs_src.ndim > 1:
+    abs_src64 = abs_src.astype(np.float64)  # float32→float64 は無損失、巻き上げで重複キャスト除去
+    if abs_src64.ndim > 1:
         env_f = np.stack([
-            np.convolve(abs_src[ch].astype(np.float64), ker_f, mode="same")
-            for ch in range(abs_src.shape[0])
+            np.convolve(abs_src64[ch], ker_f, mode="same")
+            for ch in range(abs_src64.shape[0])
         ])
         env_s = np.stack([
-            np.convolve(abs_src[ch].astype(np.float64), ker_s, mode="same")
-            for ch in range(abs_src.shape[0])
+            np.convolve(abs_src64[ch], ker_s, mode="same")
+            for ch in range(abs_src64.shape[0])
         ])
     else:
-        env_f = np.convolve(abs_src.astype(np.float64), ker_f, mode="same")
-        env_s = np.convolve(abs_src.astype(np.float64), ker_s, mode="same")
+        env_f = np.convolve(abs_src64, ker_f, mode="same")
+        env_s = np.convolve(abs_src64, ker_s, mode="same")
     diff = np.maximum(env_f - env_s, 0.0)
     # Phase 3 改善 C: ファイル全長 percentile_99 → 5 秒移動窓 99-percentile
     norm = _moving_p99_norm(diff, sr,
@@ -969,6 +982,11 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_extra = (d_res + d_exc + d_body + d_stereo + d_sub
                + d_mid_trans + d_vocal + d_low_body)
 
+    # 値は d_extra に確定済。中低域 6 path の中間配列を即解放し長尺ファイルの
+    # ピーク RSS を抑える (del は出力に一切影響しない)。d_res/d_exc は凍結ゾーン
+    # 近傍のため触れない。
+    del d_body, d_stereo, d_sub, d_mid_trans, d_vocal, d_low_body
+
     # dynamics 作用: 入力依存ゲート (SAT 残響対策、アウトロ無音区間で d_extra を 0 化)
     # 原音 |x| の moving-average envelope < threshold で d_extra * 0、エッジは zero-phase
     # LP で滑らか化。FFT 後段矯正ではなく時間領域の振幅マスク (発生源対策)。
@@ -1087,6 +1105,7 @@ class Worker(QtCore.QThread):
 
             y, sr = load_audio_safe(path)
             if sr != PARAMS.target_sr:
+                import resampy  # 遅延 import: 96k 入力のみなら numba を読み込まない
                 try:
                     y = resampy.resample(y, sr, PARAMS.target_sr, parallel=par)
                 except TypeError:
