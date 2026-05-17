@@ -120,6 +120,24 @@ STEREO_DEF_HI_HZ_R = 1500        # B: stereo_def hi 2500→1500
 CAP_ALIGN_ENABLED = True         # C: midlow 出力 LP cap を 3500 に統一 (3000/3500 二重端除去)
 MIDLOW_UNIFIED_OUT_LP_HZ = 3500  # C: body/stereo 出力 LP 3000→3500 (≤3.5k 維持、凍結非到達)
 
+# ===== Phase3 cycle3 input-adaptive (2026-05-18、各独立 env flag、default OFF=byte同一) =====
+# P+Q: 入力源特性 (crest / hf_ratio / Side-Mid 比) を file 1 回計測し、非凍結 6 path
+#   合算を bounded 連続スケール (離散モード禁止=別ソフト感源)。凍結 d_res/d_exc は
+#   スケール後加算で HF signature 入力非依存・byte 不変。env DSRE_PROFILE_SCALE=1 で ON、
+#   未設定なら scale 計算自体を skip し従来と完全 byte 同一。
+# A: 整数比 (48k→96k=×2 / 192k→96k=÷2 等) のみ scipy resample_poly + 設計 kaiser、
+#   非整数比 (44.1k/88.2k) は現 resampy kaiser_best fallback で不変。env DSRE_INT_RESAMPLE=1。
+# 源間 spread の構造上限 = [MIN,MAX] 幅 (±10% → 最悪 spread 0.20、Phase2 acceptance を数式に内包)。
+PROFILE_SCALE_MIN = 0.90         # Q: 非凍結合算スケール下限
+PROFILE_SCALE_MAX = 1.10         # Q: 上限 (±10%、源間 spread を構造的に ≤0.20 へ)
+PROFILE_CREST_REF_DB = 12.0      # Q: crest 基準 (≥=広DR→中立、未満=海苔→減衰のみ)
+PROFILE_KC = 0.020               # Q: crest 係数 (海苔ほど scale↓、過処理回避=PLR/DR 保護)
+PROFILE_HF_REF = 0.08            # Q: hf_ratio 基準 (4kHz+ / 総エネルギー)
+PROFILE_KH = 1.00                # Q: hf 係数 (曇り/ロッシー源ほど scale↑、DSEE HX 思想)
+PROFILE_SM_REF = 0.50            # Q: Side/Mid 基準 (mono≈0、広≈1)
+PROFILE_SM_KS = 0.30             # Q: SM 係数 (M/S 2 path のみ、mono/狭の過拡張回避)
+INT_RESAMPLE_KAISER_BETA = 12.0  # A: resample_poly kaiser β (高 stopband 阻止)
+
 # ===== dynamics 作用: 入力依存ゲート (v1.18 等価、SAT 残響対策) =====
 # tanh / 半波整流は微小信号でも倍音を生成するため、アウトロ/無音区間で残響と
 # してノイズフロアを上げる。原音 |x| の moving-average envelope が threshold
@@ -236,6 +254,55 @@ def _file_workers(lv: int) -> int:
     return min(2 + (lv - 6), max(1, cpus // 2))
 
 
+def _int_resample_poly(y, sr: int, tgt: int, beta: float):
+    """A: 整数比 (tgt%sr==0 / sr%tgt==0) のみ scipy resample_poly + 長 firwin
+    kaiser で透過変換。非整数比・失敗時は None を返し呼び出し側で resampy
+    fallback。短 FIR (window tuple 既定 ~20tap) は image floor が劣悪なため
+    明示的に長い firwin (cutoff=1/max(up,dn)) を設計して渡す。非凍結経路。
+    """
+    if sr <= 0 or sr == tgt:
+        return None
+    if tgt % sr == 0:
+        up, dn = tgt // sr, 1
+    elif sr % tgt == 0:
+        up, dn = 1, sr // tgt
+    else:
+        return None
+    if max(up, dn) > 16:
+        return None
+    try:
+        from scipy.signal import resample_poly, firwin
+        half = 32 * max(up, dn)            # 片側 tap 数 (×2 で 64tap/位相相当)
+        n_taps = 2 * half * max(up, dn) + 1  # 数千〜万 tap で深い stopband
+        n_taps = min(n_taps, 32769)
+        fir = firwin(n_taps, 1.0 / max(up, dn),
+                     window=("kaiser", beta)).astype(np.float64)
+        out = resample_poly(y, up, dn, axis=-1, window=fir)
+        return out.astype(np.float32, copy=False)
+    except Exception:
+        return None
+
+
+def _resample_to_target(y, sr: int, tgt: int, par: bool = False):
+    """入力 sr → tgt の単一リサンプル経路 (_process_one / render_ref 共用、二重実装回避)。
+    env DSRE_INT_RESAMPLE=1 かつ整数比なら resample_poly、それ以外は resampy
+    kaiser_best (現行・不変)。flag 未設定時は従来と完全 byte 同一。
+    """
+    if sr == tgt:
+        return y, sr
+    y_poly = None
+    if os.environ.get("DSRE_INT_RESAMPLE") == "1":
+        y_poly = _int_resample_poly(y, sr, tgt, PARAMS.int_resample_kaiser_beta)
+    if y_poly is not None:
+        return y_poly, tgt
+    import resampy  # 遅延 import: 96k 入力のみなら numba 不要
+    try:
+        y = resampy.resample(y, sr, tgt, parallel=par)
+    except TypeError:
+        y = resampy.resample(y, sr, tgt)
+    return y, tgt
+
+
 @dataclass(frozen=True)
 class DSREParams:
     m: int = HARMONIC_LAYERS
@@ -308,6 +375,16 @@ class DSREParams:
     stereo_def_hi_hz_r: int = STEREO_DEF_HI_HZ_R
     cap_align_enabled: bool = CAP_ALIGN_ENABLED
     midlow_unified_out_lp_hz: int = MIDLOW_UNIFIED_OUT_LP_HZ
+    # Phase3 cycle3 input-adaptive (env flag 制御、default 定数 = identity 寄り)
+    profile_scale_min: float = PROFILE_SCALE_MIN
+    profile_scale_max: float = PROFILE_SCALE_MAX
+    profile_crest_ref_db: float = PROFILE_CREST_REF_DB
+    profile_kc: float = PROFILE_KC
+    profile_hf_ref: float = PROFILE_HF_REF
+    profile_kh: float = PROFILE_KH
+    profile_sm_ref: float = PROFILE_SM_REF
+    profile_sm_ks: float = PROFILE_SM_KS
+    int_resample_kaiser_beta: float = INT_RESAMPLE_KAISER_BETA
 
 
 PARAMS = DSREParams()
@@ -978,6 +1055,48 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     d_vocal = _path_safety_cap(d_vocal, rms_x, peak_x, **cap_kw)
     d_low_body = _path_safety_cap(d_low_body, rms_x, peak_x, **cap_kw)
 
+    # === Phase3 cycle3: 入力源特性に対する非凍結 6 path の bounded 連続スケール ===
+    # env DSRE_PROFILE_SCALE=1 のときのみ発火。未設定なら下記 if を完全スキップし
+    # 従来式と byte 同一。凍結 d_res / d_exc はスケール対象外 (後段で無改変加算)
+    # のため HF signature は入力非依存・abf8260 凍結不変。
+    if os.environ.get("DSRE_PROFILE_SCALE") == "1":
+        try:
+            crest_db = 20.0 * np.log10(peak_x / rms_x) if rms_x > 0 else 0.0
+            mono = x if x.ndim == 1 else x.mean(axis=0)
+            N = int(mono.shape[-1])
+            W = min(N, 1 << 19)  # 代表中央窓 (~5.5s@96k)、file 1 回 O(W log W)
+            if W >= 16:
+                s0 = (N - W) // 2
+                seg = mono[s0:s0 + W].astype(np.float64)
+                sp = np.abs(np.fft.rfft(seg)) ** 2
+                fr = np.fft.rfftfreq(W, d=1.0 / sr)
+                tot = float(sp.sum()) + 1e-20
+                hf_ratio = float(sp[fr >= 4000.0].sum()) / tot
+            else:
+                hf_ratio = PARAMS.profile_hf_ref
+            if x.ndim > 1 and x.shape[0] >= 2:
+                _mid = (x[0] + x[1]) * 0.5
+                _side = (x[0] - x[1]) * 0.5
+                sm_ratio = (float(np.sqrt(np.mean(_side.astype(np.float64) ** 2)) + 1e-20)
+                            / (float(np.sqrt(np.mean(_mid.astype(np.float64) ** 2))) + 1e-12))
+            else:
+                sm_ratio = PARAMS.profile_sm_ref
+            smin, smax = PARAMS.profile_scale_min, PARAMS.profile_scale_max
+            c_term = PARAMS.profile_kc * min(0.0, crest_db - PARAMS.profile_crest_ref_db)
+            h_term = PARAMS.profile_kh * (PARAMS.profile_hf_ref - hf_ratio)
+            scale = float(np.clip(1.0 + c_term + h_term, smin, smax))
+            sm_scale = float(np.clip(1.0 + PARAMS.profile_sm_ks
+                                     * (sm_ratio - PARAMS.profile_sm_ref), smin, smax))
+            ms_eff = float(np.clip(scale * sm_scale, smin, smax))
+            d_body = (d_body * scale).astype(d_body.dtype, copy=False)
+            d_sub = (d_sub * scale).astype(d_sub.dtype, copy=False)
+            d_mid_trans = (d_mid_trans * scale).astype(d_mid_trans.dtype, copy=False)
+            d_low_body = (d_low_body * scale).astype(d_low_body.dtype, copy=False)
+            d_stereo = (d_stereo * ms_eff).astype(d_stereo.dtype, copy=False)
+            d_vocal = (d_vocal * ms_eff).astype(d_vocal.dtype, copy=False)
+        except Exception:
+            pass  # 算出失敗時は無スケール (= 従来挙動) に安全フォールバック
+
     # 加算する補完成分の合計 (d_res / d_exc は凍結出力のまま、改変なし)
     d_extra = (d_res + d_exc + d_body + d_stereo + d_sub
                + d_mid_trans + d_vocal + d_low_body)
@@ -1105,12 +1224,7 @@ class Worker(QtCore.QThread):
 
             y, sr = load_audio_safe(path)
             if sr != PARAMS.target_sr:
-                import resampy  # 遅延 import: 96k 入力のみなら numba を読み込まない
-                try:
-                    y = resampy.resample(y, sr, PARAMS.target_sr, parallel=par)
-                except TypeError:
-                    y = resampy.resample(y, sr, PARAMS.target_sr)
-                sr = PARAMS.target_sr
+                y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
             y_out = zansei_impl(
                 y, sr,
                 progress_cb=step_cb if use_step_cb else None,
