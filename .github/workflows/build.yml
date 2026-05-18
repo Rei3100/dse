@@ -47,8 +47,14 @@ jobs:
       - name: ffmpeg 最新版取得 (BtbN win64 gpl)
         shell: pwsh
         run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          # GitHub API 経由で最新リリースのアセット URL を動的取得 (直 URL は artifact 名変更で 404 になる場合あり)
+          $api = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
+          $headers = @{ 'Accept' = 'application/vnd.github.v3+json'; 'User-Agent' = 'DSRE-Builder' }
+          $release = Invoke-RestMethod -Uri $api -Headers $headers
+          $asset = $release.assets | Where-Object { $_.name -like "*win64-gpl.zip" -and $_.name -notlike "*shared*" } | Select-Object -First 1
+          if (-not $asset) { throw "ffmpeg win64-gpl.zip asset not found in BtbN latest release" }
+          Write-Host "Downloading: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ffmpeg.zip
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extract -Force
           $ff = Get-ChildItem ffmpeg_extract -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           if (-not $ff) { throw "ffmpeg.exe not found in BtbN archive" }

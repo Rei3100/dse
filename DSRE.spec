@@ -22,6 +22,8 @@ for mod in (
     "msgpack",
     "decorator",
     "cffi",
+    "pyloudnorm",
+    "future",
 ):
     d, b, h = collect_all(mod)
     datas += d
