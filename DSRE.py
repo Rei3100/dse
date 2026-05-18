@@ -27,6 +27,22 @@ from send2trash import send2trash
 # ===== 入出力 =====
 INPUT_DIR = r"C:\Audio\DSRE"
 OUTPUT_DIR = r"C:\Audio\DSRE\Output"
+METRICS_DB_PATH = os.path.join(OUTPUT_DIR, "dsre_log.db")
+
+
+def _get_dsre_version() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+_DSRE_VERSION = _get_dsre_version()
 
 
 # ===== DSP パラメータ =====
@@ -527,6 +543,117 @@ class MetricsComputer:
                 "hf_ratio_4k", "hf_ratio_8k", "hf_ratio_12k", "hf_ratio_16k",
                 "harmonic_1k_proxy",
             ]}
+
+
+class AudioMetricsLogger:
+    """処理ごとの before/after 音響メトリクスを SQLite に追記する。"""
+
+    _CREATE_SQL = """
+    CREATE TABLE IF NOT EXISTS runs (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp           TEXT,
+        filename            TEXT,
+        dsre_version        TEXT,
+        input_sr            INTEGER,
+        input_channels      INTEGER,
+        duration_sec        REAL,
+        processing_time_sec REAL,
+        input_bitrate_kbps  INTEGER,
+        rms_db_b            REAL, peak_db_b REAL, dr_b REAL, plr_b REAL,
+        lufs_b              REAL, lra_b REAL, clip_count_b INTEGER,
+        centroid_hz_b       REAL, rolloff_hz_b REAL, flatness_b REAL,
+        hf_ratio_4k_b       REAL, hf_ratio_8k_b REAL,
+        hf_ratio_12k_b      REAL, hf_ratio_16k_b REAL, harmonic_1k_proxy_b REAL,
+        rms_db_a            REAL, peak_db_a REAL, dr_a REAL, plr_a REAL,
+        lufs_a              REAL, lra_a REAL, clip_count_a INTEGER,
+        centroid_hz_a       REAL, rolloff_hz_a REAL, flatness_a REAL,
+        hf_ratio_4k_a       REAL, hf_ratio_8k_a REAL,
+        hf_ratio_12k_a      REAL, hf_ratio_16k_a REAL, harmonic_1k_proxy_a REAL,
+        adaptive_layers     INTEGER,
+        adaptive_mode       TEXT,
+        hf_ratio_input      REAL
+    )
+    """
+
+    @classmethod
+    def log(
+        cls,
+        input_path: str,
+        input_audio,
+        output_audio,
+        sr: int,
+        processing_time_sec: float,
+        adaptive_layers=None,
+        adaptive_mode=None,
+        hf_ratio_input=None,
+    ) -> None:
+        """
+        メトリクスを計算して DB に 1 行追記。例外は握り潰す（処理をブロックしない）。
+        input_audio: 96k リサンプル済の処理前音声 (numpy array)
+        output_audio: zansei_impl 処理後音声 (numpy array)
+        """
+        try:
+            import datetime
+            b = MetricsComputer.compute(input_audio, sr)
+            a = MetricsComputer.compute(output_audio, sr)
+
+            if input_audio.ndim == 2:
+                channels = input_audio.shape[0]
+                duration = input_audio.shape[1] / sr
+            else:
+                channels = 1
+                duration = len(input_audio) / sr
+
+            try:
+                info = sf.info(input_path)
+                bitrate = int(info.extra_info.get("bitrate", 0)) or None
+            except Exception:
+                bitrate = None
+
+            row = {
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "filename": os.path.basename(input_path),
+                "dsre_version": _DSRE_VERSION,
+                "input_sr": sr,
+                "input_channels": channels,
+                "duration_sec": duration,
+                "processing_time_sec": processing_time_sec,
+                "input_bitrate_kbps": bitrate,
+                "rms_db_b": b["rms_db"], "peak_db_b": b["peak_db"],
+                "dr_b": b["dr"], "plr_b": b["plr"],
+                "lufs_b": b["lufs"], "lra_b": b["lra"],
+                "clip_count_b": b["clip_count"],
+                "centroid_hz_b": b["centroid_hz"], "rolloff_hz_b": b["rolloff_hz"],
+                "flatness_b": b["flatness"],
+                "hf_ratio_4k_b": b["hf_ratio_4k"], "hf_ratio_8k_b": b["hf_ratio_8k"],
+                "hf_ratio_12k_b": b["hf_ratio_12k"], "hf_ratio_16k_b": b["hf_ratio_16k"],
+                "harmonic_1k_proxy_b": b["harmonic_1k_proxy"],
+                "rms_db_a": a["rms_db"], "peak_db_a": a["peak_db"],
+                "dr_a": a["dr"], "plr_a": a["plr"],
+                "lufs_a": a["lufs"], "lra_a": a["lra"],
+                "clip_count_a": a["clip_count"],
+                "centroid_hz_a": a["centroid_hz"], "rolloff_hz_a": a["rolloff_hz"],
+                "flatness_a": a["flatness"],
+                "hf_ratio_4k_a": a["hf_ratio_4k"], "hf_ratio_8k_a": a["hf_ratio_8k"],
+                "hf_ratio_12k_a": a["hf_ratio_12k"], "hf_ratio_16k_a": a["hf_ratio_16k"],
+                "harmonic_1k_proxy_a": a["harmonic_1k_proxy"],
+                "adaptive_layers": adaptive_layers,
+                "adaptive_mode": adaptive_mode,
+                "hf_ratio_input": hf_ratio_input,
+            }
+
+            os.makedirs(os.path.dirname(METRICS_DB_PATH), exist_ok=True)
+            with sqlite3.connect(METRICS_DB_PATH) as conn:
+                conn.execute(cls._CREATE_SQL)
+                cols = ", ".join(row.keys())
+                placeholders = ", ".join("?" * len(row))
+                conn.execute(
+                    f"INSERT INTO runs ({cols}) VALUES ({placeholders})",
+                    list(row.values()),
+                )
+                conn.commit()
+        except Exception:
+            pass  # ロガー失敗は処理結果に影響させない
 
 
 # ===== バンドルリソースのパス解決 =====
