@@ -20,7 +20,7 @@ def test_metrics_keys_present():
         "rms_db", "peak_db", "dr", "plr", "lufs", "lra",
         "clip_count", "centroid_hz", "rolloff_hz", "flatness",
         "hf_ratio_4k", "hf_ratio_8k", "hf_ratio_12k", "hf_ratio_16k",
-        "thd_proxy",
+        "harmonic_1k_proxy",
     ]
     for k in expected_keys:
         assert k in result, f"missing key: {k}"

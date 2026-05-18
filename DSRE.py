@@ -447,8 +447,27 @@ class MetricsComputer:
             result["lufs"] = lufs
             result["plr"] = (result["peak_db"] - lufs) if lufs is not None else None
 
+            # LRA approximation via short-term loudness blocks (EBU R128 simplified)
             try:
-                lra = float(pyln.loudness_range(audio_pln.astype(np.float64), sr))
+                block_dur = 3.0  # 3-second short-term blocks
+                block_len = int(sr * block_dur)
+                n_blocks = len(audio_pln) // block_len
+                if n_blocks >= 2:
+                    st_loudness = []
+                    for i in range(n_blocks):
+                        blk = audio_pln[i * block_len:(i + 1) * block_len]
+                        try:
+                            st = meter.integrated_loudness(blk.astype(np.float64))
+                            if st > -70:  # gate: exclude silence blocks
+                                st_loudness.append(st)
+                        except Exception:
+                            pass
+                    if len(st_loudness) >= 2:
+                        lra = float(max(st_loudness) - min(st_loudness))
+                    else:
+                        lra = None
+                else:
+                    lra = None
             except Exception:
                 lra = None
             result["lra"] = lra
@@ -494,9 +513,9 @@ class MetricsComputer:
                 f0_e = spec[max(0, f0_idx - margin):f0_idx + margin + 1].sum()
                 f2_e = spec[max(0, 2 * f0_idx - margin):2 * f0_idx + margin + 1].sum()
                 f3_e = spec[max(0, 3 * f0_idx - margin):3 * f0_idx + margin + 1].sum()
-                result["thd_proxy"] = float((f2_e + f3_e) / (f0_e + 1e-30))
+                result["harmonic_1k_proxy"] = float((f2_e + f3_e) / (f0_e + 1e-30))
             except Exception:
-                result["thd_proxy"] = None
+                result["harmonic_1k_proxy"] = None
 
             return result
 
@@ -506,7 +525,7 @@ class MetricsComputer:
                 "rms_db", "peak_db", "dr", "plr", "lufs", "lra", "clip_count",
                 "centroid_hz", "rolloff_hz", "flatness",
                 "hf_ratio_4k", "hf_ratio_8k", "hf_ratio_12k", "hf_ratio_16k",
-                "thd_proxy",
+                "harmonic_1k_proxy",
             ]}
 
 
