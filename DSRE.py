@@ -13,6 +13,8 @@ import numpy as np
 import soundfile as sf
 from scipy import signal
 from scipy.fft import next_fast_len
+import sqlite3
+import pyloudnorm as pyln
 # librosa / resampy は遅延 import (使用箇所で import)。
 # numba/llvmlite JIT を GUI 起動経路から外し体感起動を短縮する。
 # librosa: load_audio_safe フォールバック時のみ。resampy: 非 96k 入力のリサンプル時のみ。
@@ -391,6 +393,121 @@ class DSREParams:
 
 
 PARAMS = DSREParams()
+
+
+# ===== 音響メトリクス計算 =====
+
+class MetricsComputer:
+    """処理前後の音響メトリクスを numpy/scipy/pyloudnorm で計算する純粋関数クラス。"""
+
+    @staticmethod
+    def compute(audio: np.ndarray, sr: int) -> dict:
+        """
+        audio: shape (samples,) または (2, samples) の float32/64
+        sr: サンプルレート
+        戻り値: メトリクス名 → 値 の dict。計算失敗時は None。
+        """
+        try:
+            # ステレオは L/R 平均してモノに変換（スペクトル系指標用）
+            if audio.ndim == 2:
+                mono = audio.mean(axis=0)
+            else:
+                mono = audio
+
+            result = {}
+
+            # --- 基本レベル ---
+            rms = float(np.sqrt(np.mean(mono ** 2)))
+            peak = float(np.max(np.abs(mono)))
+            result["rms_db"] = 20 * np.log10(rms + 1e-9)
+            result["peak_db"] = 20 * np.log10(peak + 1e-9)
+
+            # --- DR (TT DR meter 準拠: ブロック 3秒分割、各ブロック RMS peak vs 全体 RMS) ---
+            block_len = sr * 3
+            n_blocks = max(1, len(mono) // block_len)
+            block_peaks = []
+            block_rms_vals = []
+            for i in range(n_blocks):
+                blk = mono[i * block_len:(i + 1) * block_len]
+                block_peaks.append(20 * np.log10(np.max(np.abs(blk)) + 1e-9))
+                block_rms_vals.append(20 * np.log10(np.sqrt(np.mean(blk ** 2)) + 1e-9))
+            result["dr"] = round(np.mean(block_peaks) - np.mean(block_rms_vals), 2)
+
+            # --- LUFS / LRA (pyloudnorm) ---
+            meter = pyln.Meter(sr)
+            # pyloudnorm は (samples, channels) の shape を期待
+            if audio.ndim == 2:
+                audio_pln = audio.T  # (samples, 2)
+            else:
+                audio_pln = audio.reshape(-1, 1)  # (samples, 1)
+            try:
+                lufs = float(meter.integrated_loudness(audio_pln.astype(np.float64)))
+            except Exception:
+                lufs = None
+            result["lufs"] = lufs
+            result["plr"] = (result["peak_db"] - lufs) if lufs is not None else None
+
+            try:
+                lra = float(pyln.loudness_range(audio_pln.astype(np.float64), sr))
+            except Exception:
+                lra = None
+            result["lra"] = lra
+
+            # --- クリップカウント ---
+            result["clip_count"] = int(np.sum(np.abs(mono) >= 1.0))
+
+            # --- スペクトル系 (scipy) ---
+            from scipy.signal import welch
+            freqs, psd = welch(mono, fs=sr, nperseg=min(4096, len(mono)))
+            psd_sum = psd.sum()
+
+            if psd_sum > 0:
+                result["centroid_hz"] = float(np.sum(freqs * psd) / psd_sum)
+
+                cumsum = np.cumsum(psd)
+                rolloff_idx = np.searchsorted(cumsum, 0.85 * psd_sum)
+                result["rolloff_hz"] = float(freqs[min(rolloff_idx, len(freqs) - 1)])
+
+                geometric_mean = np.exp(np.mean(np.log(psd + 1e-30)))
+                arithmetic_mean = psd_sum / len(psd)
+                result["flatness"] = float(geometric_mean / (arithmetic_mean + 1e-30))
+            else:
+                result["centroid_hz"] = None
+                result["rolloff_hz"] = None
+                result["flatness"] = None
+
+            # --- HF ratio (numpy FFT) ---
+            n_fft = next_fast_len(len(mono))
+            spec = np.abs(np.fft.rfft(mono, n=n_fft)) ** 2
+            f_axis = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+            total_e = spec.sum() + 1e-30
+            for cutoff in (4000, 8000, 12000, 16000):
+                result[f"hf_ratio_{cutoff // 1000}k"] = float(
+                    spec[f_axis >= cutoff].sum() / total_e
+                )
+
+            # --- THD proxy (基音 vs 2次/3次倍音エネルギー比) ---
+            try:
+                bin_hz = f_axis[1] - f_axis[0]
+                f0_idx = int(1000 / bin_hz)
+                margin = max(1, int(100 / bin_hz))
+                f0_e = spec[max(0, f0_idx - margin):f0_idx + margin + 1].sum()
+                f2_e = spec[max(0, 2 * f0_idx - margin):2 * f0_idx + margin + 1].sum()
+                f3_e = spec[max(0, 3 * f0_idx - margin):3 * f0_idx + margin + 1].sum()
+                result["thd_proxy"] = float((f2_e + f3_e) / (f0_e + 1e-30))
+            except Exception:
+                result["thd_proxy"] = None
+
+            return result
+
+        except Exception:
+            # ロガーがメイン処理をブロックしてはならない
+            return {k: None for k in [
+                "rms_db", "peak_db", "dr", "plr", "lufs", "lra", "clip_count",
+                "centroid_hz", "rolloff_hz", "flatness",
+                "hf_ratio_4k", "hf_ratio_8k", "hf_ratio_12k", "hf_ratio_16k",
+                "thd_proxy",
+            ]}
 
 
 # ===== バンドルリソースのパス解決 =====
