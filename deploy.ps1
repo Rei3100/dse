@@ -60,7 +60,19 @@ if ($running) {
     }
 }
 
-# 3. 旧ターゲットをバックアップ ($TargetDir -> $TargetDir.bak)
+# 3. 永続ファイルを一時退避 (deploy をまたいで保持すべきファイル)
+$persistFiles = @("dsre_log.db", "state.ini")
+$persistTemp = Join-Path $env:TEMP ("DSRE_persist_{0}" -f (Get-Date -Format "yyyyMMddHHmmss"))
+New-Item -ItemType Directory -Path $persistTemp -Force | Out-Null
+foreach ($pf in $persistFiles) {
+    $src = Join-Path $TargetDir $pf
+    if (Test-Path $src) {
+        Copy-Item $src (Join-Path $persistTemp $pf)
+        Write-Host "[deploy] saved persistent: $pf"
+    }
+}
+
+# 4. 旧ターゲットをバックアップ ($TargetDir -> $TargetDir.bak)
 $backup = "$TargetDir.bak"
 $oldBackup = "$TargetDir.bak.prev"
 if (Test-Path $TargetDir) {
@@ -75,10 +87,20 @@ if (Test-Path $TargetDir) {
     Rename-Item $TargetDir $backup
 }
 
-# 4. 配置
+# 5. 配置
 Write-Host "[deploy] copy $Source -> $TargetDir"
 New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
 Copy-Item (Join-Path $Source "*") $TargetDir -Recurse -Force
+
+# 5b. 永続ファイルを復元
+foreach ($pf in $persistFiles) {
+    $saved = Join-Path $persistTemp $pf
+    if (Test-Path $saved) {
+        Copy-Item $saved (Join-Path $TargetDir $pf) -Force
+        Write-Host "[deploy] restored persistent: $pf"
+    }
+}
+Remove-Item $persistTemp -Recurse -Force -ErrorAction SilentlyContinue
 
 # 5. 配置後スモーク (失敗したらロールバック)
 try {
