@@ -27,7 +27,7 @@ from send2trash import send2trash
 # ===== 入出力 =====
 INPUT_DIR = r"C:\Audio\DSRE"
 OUTPUT_DIR = r"C:\Audio\DSRE\Output"
-METRICS_DB_PATH = os.path.join(OUTPUT_DIR, "dsre_log.db")
+METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
 def _get_dsre_version() -> str:
