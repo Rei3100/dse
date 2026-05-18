@@ -1492,13 +1492,22 @@ class Worker(QtCore.QThread):
             y, sr = load_audio_safe(path)
             if sr != PARAMS.target_sr:
                 y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
+            t0 = time.perf_counter()
             y_out = zansei_impl(
                 y, sr,
                 progress_cb=step_cb if use_step_cb else None,
                 abort_cb=lambda: self._abort,
             )
+            proc_time = time.perf_counter() - t0
             out = os.path.join(OUTPUT_DIR, os.path.basename(path))
             save_flac24_out(path, y_out, sr, out)
+            AudioMetricsLogger.log(
+                input_path=path,
+                input_audio=y,
+                output_audio=y_out,
+                sr=sr,
+                processing_time_sec=proc_time,
+            )
             try:
                 send2trash(path)
             except Exception:
