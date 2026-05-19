@@ -788,104 +788,94 @@ def _true_peak(data_sc, oversample=8, chunk=1 << 20):
     return max(peak, raw)
 
 
-def trim_silence(y, sr,
-                 head_junk_ceil_db=-50.0, tail_junk_ceil_db=-60.0,
-                 hard_protect_db=-40.0,
-                 frame_ms=30.0, hop_ms=10.0, sustain_ms=150.0,
-                 head_buffer_s=0.20, tail_buffer_s=1.0,
-                 head_min_trim_s=0.5, tail_min_trim_s=2.0,
+def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=60.0, ref_pct=90.0,
+                 blk_ms=1.0, head_min_trim_s=0.02, tail_min_trim_s=0.02,
                  min_content_s=10.0, max_trim_s=180.0):
-    """絶対閾値 + ハード保護の曲頭/末トリム。y: (channels, samples) or (samples,)。
-    戻り値: (proposed_trimmed_y, head_trim_s, tail_trim_s)。
+    """『通常音量で知覚されない曲頭/曲末』を限界まで除去 (相対可聴閾モデル)。
+    y: (channels, samples) or (samples,)。戻り: (trimmed_y, head_s, tail_s)。
 
-    旧「ノイズ床相対」方式は実音源で破綻 (曲中の静かな箇所がパーセンタイルを汚染
-    → 必要なイントロ/アウトロを誤削除)。本版は曲のダイナミクスに影響されない
-    絶対閾値 + 楽音ハード保護で necessary を構造的に守る:
+    **必ずリサンプル前の元音声に適用すること** (呼び出し側責務)。元の鋭い
+    無音→音楽 edit をアップサンプルすると FIR プリリンギングが無音側へ滲み、
+    境界が不正確になる (実測: 元 295ms 純ゼロが resample 後は誤検出)。
 
-    - head_junk_ceil_db (-50dBFS): 先頭で端から連続してこの値「未満」の区間
-      のみ junk 候補 (室内ノイズ/ヒス/無音は通常 -55〜-75dBFS)。-45dBFS の
-      静音イントロは ceil より上なので junk run 長 ≈ 0 → 削られない。
-    - tail_junk_ceil_db (-60dBFS): 末尾は減衰リバーブ余韻とヒスがレベルで
-      区別不能なため ceil を低くし保守化。-50〜-60dB の余韻は守り、明確な
-      ノイズ床 (< -60dB) のみ除去 (「アウトロ削除は論外」を最優先で担保)。
-    - hard_protect_db (-40dBFS): sustain_ms 継続でこれ以上なら確実に楽音。
-      その最初の位置より前へは絶対に踏み込まない (ハード保護限界)。
-    - 先頭: frame0 から head ceil 未満が連続する run のみ。先頭が既に
-      ceil 以上なら即停止 = トリムなし。head_min_trim_s 未満も触らない。
-    - 末尾: 末端から tail ceil 未満が連続する run。アウトロ余韻保護のため
-      tail_min_trim_s を長め (2.0s)、tail_buffer も大 (1.0s)。
-    - 安全弁: max_trim_s 超の側は異常スキップ / content < min_content_s 全スキップ。
+    思想 (ユーザー、全音源普遍・妥協不可、memory project_dsre_trim_philosophy):
+    判定は物理でなく**知覚**。普段の最適音量で主観で無音に感じる端 = 不要
+    (Audacity で MAX 増幅し波形/曲が残っても、その爆音では聴かない)。通常
+    音量で**可聴**な部分 = 必要、絶対に消さない。
 
-    重要: 本関数は「提案」を計算してログ可能にするが、実切断の適用可否は
-    呼び出し側が DSRE_TRIM_APPLY で制御する (デフォルトは report-only)。
+    破綻史: 絶対閾単独→静音マスタで inert / bSFM→不可聴尾を誤保護 /
+    30ms RMS frame→鋭い無音↔可聴 edit を鈍らせ不可聴ランプを残す。実測
+    (元 01.005): 0-295ms 純ゼロ → 295-312ms -90〜-70dBFS 不可聴ランプ →
+    312ms 実可聴。30ms RMS 版は 290ms で切り不可聴 295-312ms を保持していた。
+
+    本版 = **元音声・1ms peak ブロックのサンプル精度 相対可聴閾**:
+      blk_db   = blk_ms(1ms) 毎の peak dBFS (RMS でなく peak: 鋭い edit を
+                 鈍らせない。Audacity の波形目視と一致)
+      ref_db   = blk_db の ref_pct(90) パーセンタイル (本体プログラムレベル)
+      floor_head = ref_db - head_drop_db / floor_tail = ref_db - tail_drop_db
+      頭は最初に floor_head 以上の block、末は最後に floor_tail 以上の block
+      で停止 (buffer0=1ms 精密)。不可聴ランプも純ゼロも一律除去、可聴は不可侵。
+
+    - head/tail 非対称 (ユーザー実聴較正): 末尾は faint 減衰 fade を残す方が
+      自然 (tail_drop 大=保守、実聴 60 確定)。頭は不可聴前部を限界まで削る
+      (head_drop 小=積極)。両者ともユーザーが実トリム済みフル音声を通常
+      音量で A/B し較正する主ノブ。
+    - 安全弁: max_trim_s 超側は異常スキップ / content < min_content_s 全スキップ。
+
+    重要: 本関数は「提案」を計算するのみ。実切断適用は呼び出し側が
+    DSRE_TRIM_APPLY で制御 (デフォルト report-only)。
     """
     is_mono = y.ndim == 1
     n = len(y) if is_mono else y.shape[-1]
     if n < int(min_content_s * sr):
         return y, 0.0, 0.0
-    amp = np.abs(y) if is_mono else np.max(np.abs(y), axis=0)
+    amp = (np.abs(y) if is_mono
+           else np.max(np.abs(y), axis=0)).astype(np.float64, copy=False)
 
-    frame = max(1, int(frame_ms * sr / 1000.0))
-    hop = max(1, int(hop_ms * sr / 1000.0))
-    n_frames = 1 + (n - frame) // hop if n >= frame else 0
-    if n_frames < 8:
+    blk = max(1, int(blk_ms * sr / 1000.0))
+    nbk = n // blk
+    if nbk < 8:
         return y, 0.0, 0.0
+    # 1ms 毎 peak (非重複ブロック)。サンプル精度で無音↔可聴 edit を捉える。
+    blk_peak = amp[:nbk * blk].reshape(nbk, blk).max(axis=1)
+    blk_db = 20.0 * np.log10(blk_peak + 1e-12)
 
-    starts = np.arange(n_frames) * hop
-    sq = amp.astype(np.float64) ** 2
-    csum = np.concatenate(([0.0], np.cumsum(sq)))
-    seg_e = (csum[starts + frame] - csum[starts]) / frame
-    energy_db = 10.0 * np.log10(seg_e + 1e-20)
+    ref_db = float(np.percentile(blk_db, ref_pct))  # 本体プログラムレベル
+    floor_head = ref_db - head_drop_db
+    floor_tail = ref_db - tail_drop_db
 
-    sustain_fr = max(1, int(sustain_ms / hop_ms))
+    head_ok = blk_db >= floor_head
+    tail_ok = blk_db >= floor_tail
+    if not head_ok.any() or not tail_ok.any():
+        return y, 0.0, 0.0  # 全 block 閾下 (異常) → 触らない
+    first_aud = int(np.where(head_ok)[0][0])
+    last_aud = int(np.where(tail_ok)[0][-1])
 
-    # ハード保護: hard_protect_db を sustain 継続する最初/最後の楽音 frame
-    loud = energy_db >= hard_protect_db
-    music_first_fr = -1
-    music_last_fr = -1
-    if sustain_fr > 1 and loud.size >= sustain_fr:
-        win = np.convolve(loud.astype(np.int32),
-                          np.ones(sustain_fr, np.int32), "valid")
-        sidx = np.where(win == sustain_fr)[0]
-        if sidx.size:
-            music_first_fr = int(sidx[0])
-            music_last_fr = int(sidx[-1]) + sustain_fr - 1
-    if music_first_fr < 0:
-        idx = np.where(loud)[0]
-        if idx.size == 0:
-            return y, 0.0, 0.0  # 楽音が全く無い → 触らない
-        music_first_fr = int(idx[0])
-        music_last_fr = int(idx[-1])
-
-    above_head = energy_db >= head_junk_ceil_db
-    above_tail = energy_db >= tail_junk_ceil_db
-
-    # 先頭 junk: frame0 から head ceil 未満が連続する run
     head_start = 0
-    if not above_head[0]:
-        hit = np.where(above_head)[0]
-        junk_end_fr = int(hit[0]) if hit.size else n_frames
-        junk_end_fr = min(junk_end_fr, music_first_fr)  # ハード保護
-        cand = max(0, junk_end_fr * hop - int(head_buffer_s * sr))
+    if first_aud > 0:
+        cand = first_aud * blk  # 最初の可聴 block 先頭まで除去 (buffer0=限界)
         if cand >= int(head_min_trim_s * sr):
             head_start = cand
 
-    # 末尾 junk: 末端から tail ceil 未満が連続する run (低 ceil = 余韻保護)
     tail_end = n
-    if not above_tail[-1]:
-        hit = np.where(above_tail)[0]
-        last_loud_fr = int(hit[-1]) if hit.size else -1
-        last_loud_fr = max(last_loud_fr, music_last_fr)  # ハード保護
-        content_end = last_loud_fr * hop + frame
-        cand = min(n, content_end + int(tail_buffer_s * sr))
+    if last_aud < nbk - 1:
+        cand = min(n, (last_aud + 1) * blk)  # 最後の可聴 block 末まで保持
         if (n - cand) >= int(tail_min_trim_s * sr):
             tail_end = cand
 
-    # max_trim_s 超の側は異常スキップ
     if head_start > int(max_trim_s * sr):
         head_start = 0
     if (n - tail_end) > int(max_trim_s * sr):
         tail_end = n
+    if os.environ.get("DSRE_TRIM_DEBUG") == "1":
+        sys.stderr.write(
+            f"[trimdbg] n={n} sr={sr} nbk={nbk} ref={ref_db:.1f}dB "
+            f"fh={floor_head:.1f}(d{head_drop_db}) "
+            f"ft={floor_tail:.1f}(d{tail_drop_db}) "
+            f"first_aud={first_aud}blk({first_aud*blk/sr*1000:.0f}ms) "
+            f"last_aud={last_aud} "
+            f"head_start={head_start}({head_start/sr*1000:.0f}ms) "
+            f"tail_end=n-{(n-tail_end)/sr:.3f}s\n")
     if (tail_end - head_start) < int(min_content_s * sr):
         return y, 0.0, 0.0
     if head_start == 0 and tail_end == n:
@@ -1659,13 +1649,11 @@ class Worker(QtCore.QThread):
                     self.sig_step.emit(int(cur * 100 / m))
 
             y, sr = load_audio_safe(path)
-            if sr != PARAMS.target_sr:
-                y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
-            # 無音トリム: 2 段階制御。
+            # 無音トリムは **リサンプル前の元音声** に適用 (アップサンプルは
+            # 無音→音楽ハード edit に FIR プリリンギングを滲ませ境界を不正確に
+            # するため。実測確定)。2 段階制御:
             #   DSRE_TRIM_SILENCE=1 → 提案を計算しログ出力 (report-only、音声不変)
             #   さらに DSRE_TRIM_APPLY=1 → 実際に切断を適用
-            # 実音源で精度をログ検証してから初めて APPLY する設計 (壊滅的・無音
-            # 失敗を観測可能な安全失敗に変える)。
             if os.environ.get("DSRE_TRIM_SILENCE") == "1":
                 trimmed, head_s, tail_s = trim_silence(y, sr)
                 if head_s > 0 or tail_s > 0:
@@ -1673,6 +1661,8 @@ class Worker(QtCore.QThread):
                     _log_trim(path, head_s, tail_s, applied)
                     if applied:
                         y = trimmed
+            if sr != PARAMS.target_sr:
+                y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
             t0 = time.perf_counter()
             y_out = zansei_impl(
                 y, sr,
