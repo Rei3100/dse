@@ -790,7 +790,7 @@ def _true_peak(data_sc, oversample=8, chunk=1 << 20):
 
 def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=60.0, ref_pct=90.0,
                  blk_ms=1.0, head_min_trim_s=0.02, tail_min_trim_s=0.02,
-                 min_content_s=10.0, max_trim_s=180.0):
+                 min_content_s=1.0, max_trim_s=180.0):
     """『通常音量で知覚されない曲頭/曲末』を限界まで除去 (相対可聴閾モデル)。
     y: (channels, samples) or (samples,)。戻り: (trimmed_y, head_s, tail_s)。
 
