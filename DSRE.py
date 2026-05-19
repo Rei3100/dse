@@ -1651,16 +1651,12 @@ class Worker(QtCore.QThread):
             y, sr = load_audio_safe(path)
             # 無音トリムは **リサンプル前の元音声** に適用 (アップサンプルは
             # 無音→音楽ハード edit に FIR プリリンギングを滲ませ境界を不正確に
-            # するため。実測確定)。2 段階制御:
-            #   DSRE_TRIM_SILENCE=1 → 提案を計算しログ出力 (report-only、音声不変)
-            #   さらに DSRE_TRIM_APPLY=1 → 実際に切断を適用
-            if os.environ.get("DSRE_TRIM_SILENCE") == "1":
+            # するため。実測確定)。常時 apply。DSRE_TRIM_SILENCE=0 で無効化。
+            if os.environ.get("DSRE_TRIM_SILENCE") != "0":
                 trimmed, head_s, tail_s = trim_silence(y, sr)
                 if head_s > 0 or tail_s > 0:
-                    applied = os.environ.get("DSRE_TRIM_APPLY") == "1"
-                    _log_trim(path, head_s, tail_s, applied)
-                    if applied:
-                        y = trimmed
+                    _log_trim(path, head_s, tail_s, applied=True)
+                    y = trimmed
             if sr != PARAMS.target_sr:
                 y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
             t0 = time.perf_counter()
