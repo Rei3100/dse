@@ -788,42 +788,42 @@ def _true_peak(data_sc, oversample=8, chunk=1 << 20):
     return max(peak, raw)
 
 
-def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=60.0, ref_pct=90.0,
+def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=40.0,
+                 grad_thr_db_per_ms=0.005, smooth_ms=3.0, ref_pct=90.0,
                  blk_ms=1.0, head_min_trim_s=0.02, tail_min_trim_s=0.02,
                  min_content_s=1.0, max_trim_s=180.0):
-    """『通常音量で知覚されない曲頭/曲末』を限界まで除去 (相対可聴閾モデル)。
+    """『通常音量で知覚されない曲頭/曲末』を限界まで除去 (level+gradient 知覚モデル)。
     y: (channels, samples) or (samples,)。戻り: (trimmed_y, head_s, tail_s)。
 
-    **必ずリサンプル前の元音声に適用すること** (呼び出し側責務)。元の鋭い
-    無音→音楽 edit をアップサンプルすると FIR プリリンギングが無音側へ滲み、
-    境界が不正確になる (実測: 元 295ms 純ゼロが resample 後は誤検出)。
+    **必ずリサンプル前の元音声に適用すること** (呼び出し側責務)。アップサンプル
+    の FIR プリリンギングが無音側へ滲み境界精度を破壊するため。
 
-    思想 (ユーザー、全音源普遍・妥協不可、memory project_dsre_trim_philosophy):
-    判定は物理でなく**知覚**。普段の最適音量で主観で無音に感じる端 = 不要
-    (Audacity で MAX 増幅し波形/曲が残っても、その爆音では聴かない)。通常
-    音量で**可聴**な部分 = 必要、絶対に消さない。
+    思想 (ユーザー、全音源普遍・妥協不可):
+    通常音量で**可聴 = 必要、絶対に 1 frame も消さない**。
+    通常音量で**無音に感じる = 不要、限界まで削る**。保守的は不可。
 
-    破綻史: 絶対閾単独→静音マスタで inert / bSFM→不可聴尾を誤保護 /
-    30ms RMS frame→鋭い無音↔可聴 edit を鈍らせ不可聴ランプを残す。実測
-    (元 01.005): 0-295ms 純ゼロ → 295-312ms -90〜-70dBFS 不可聴ランプ →
-    312ms 実可聴。30ms RMS 版は 290ms で切り不可聴 295-312ms を保持していた。
+    破綻史と本版の到達点:
+      level 単独閾: フェードインの低レベル部分を「不要」と誤分類 → 必要部分削除
+        (Your Seraphim フェードイン破壊事件 2026-05-20、決定的失敗)
+      → **level + gradient 二条件**で解決:
+        silence = (smooth_db < ref - drop_db) AND (|gradient| < grad_thr)
+        ・フェードイン: gradient > 0 → silence 不成立 → 完全保護
+        ・鋭い silence→music: gradient ジャンプで blk_ms 精度検出
+        ・静的無音 (digital zero/定常ハム): level<floor & grad≈0 → trim
+        ・reverb tail: 時間軸変化 = gradient → 保護
 
-    本版 = **元音声・1ms peak ブロックのサンプル精度 相対可聴閾**:
-      blk_db   = blk_ms(1ms) 毎の peak dBFS (RMS でなく peak: 鋭い edit を
-                 鈍らせない。Audacity の波形目視と一致)
-      ref_db   = blk_db の ref_pct(90) パーセンタイル (本体プログラムレベル)
-      floor_head = ref_db - head_drop_db / floor_tail = ref_db - tail_drop_db
-      頭は最初に floor_head 以上の block、末は最後に floor_tail 以上の block
-      で停止 (buffer0=1ms 精密)。不可聴ランプも純ゼロも一律除去、可聴は不可侵。
+    変数:
+      blk_db    = 1ms 毎 peak dBFS (Audacity 波形目視と一致)
+      ref_db    = blk_db の 90 パーセンタイル (本体プログラムレベル)
+      smooth_db = blk_db の smooth_ms 移動平均 (単 block ノイズ除去)
+      grad      = |diff(smooth_db)| dB/ms (フェード/エッジ検出)
+      head/tail_drop_db: level floor (ref からの相対深さ、各 40dB)。gradient が
+        フェード/decay を保護するので tail 非対称不要 (旧 60→40 に均一化)
+      grad_thr_db_per_ms=0.005: 0.005dB/ms 以上の変化 = 音楽。極遅 fade
+        (5dB/sec) まで保護。digital silence (grad≈0) のみ trim 対象
+      smooth_ms=3: 単 block 跳ね除去 + エッジ検出力維持の均衡
 
-    - head/tail 非対称 (ユーザー実聴較正): 末尾は faint 減衰 fade を残す方が
-      自然 (tail_drop 大=保守、実聴 60 確定)。頭は不可聴前部を限界まで削る
-      (head_drop 小=積極)。両者ともユーザーが実トリム済みフル音声を通常
-      音量で A/B し較正する主ノブ。
-    - 安全弁: max_trim_s 超側は異常スキップ / content < min_content_s 全スキップ。
-
-    重要: 本関数は「提案」を計算するのみ。実切断適用は呼び出し側が
-    DSRE_TRIM_APPLY で制御 (デフォルト report-only)。
+    重要: 本関数は提案を計算 + 切断のみ。呼び出し側で常時 apply。
     """
     is_mono = y.ndim == 1
     n = len(y) if is_mono else y.shape[-1]
@@ -836,30 +836,51 @@ def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=60.0, ref_pct=90.0,
     nbk = n // blk
     if nbk < 8:
         return y, 0.0, 0.0
-    # 1ms 毎 peak (非重複ブロック)。サンプル精度で無音↔可聴 edit を捉える。
     blk_peak = amp[:nbk * blk].reshape(nbk, blk).max(axis=1)
     blk_db = 20.0 * np.log10(blk_peak + 1e-12)
 
-    ref_db = float(np.percentile(blk_db, ref_pct))  # 本体プログラムレベル
+    ref_db = float(np.percentile(blk_db, ref_pct))
     floor_head = ref_db - head_drop_db
     floor_tail = ref_db - tail_drop_db
 
-    head_ok = blk_db >= floor_head
-    tail_ok = blk_db >= floor_tail
-    if not head_ok.any() or not tail_ok.any():
-        return y, 0.0, 0.0  # 全 block 閾下 (異常) → 触らない
-    first_aud = int(np.where(head_ok)[0][0])
-    last_aud = int(np.where(tail_ok)[0][-1])
+    # Centered moving-average smoothing (cumsum O(N) implementation)
+    sm = max(1, int(round(smooth_ms / blk_ms)))
+    if sm > 1:
+        pad_l = sm // 2
+        pad_r = sm - pad_l - 1
+        padded = np.concatenate([
+            np.full(pad_l, blk_db[0]), blk_db, np.full(pad_r, blk_db[-1])
+        ])
+        cs = np.cumsum(np.insert(padded, 0, 0.0))
+        smooth_db = (cs[sm:] - cs[:-sm]) / sm
+        smooth_db = smooth_db[:nbk]
+    else:
+        smooth_db = blk_db
+
+    # Per-ms gradient magnitude. blk_ms=1 → grad[i] is dB change in 1ms.
+    grad = np.abs(np.diff(smooth_db, prepend=smooth_db[0])) / blk_ms
+
+    # Silence = level below floor AND signal is stationary.
+    # フェードインは grad>thr で music 扱い → 完全保護
+    nonstationary = grad >= grad_thr_db_per_ms
+    head_silence = (smooth_db < floor_head) & ~nonstationary
+    tail_silence = (smooth_db < floor_tail) & ~nonstationary
+    head_music = ~head_silence
+    tail_music = ~tail_silence
+    if not head_music.any() or not tail_music.any():
+        return y, 0.0, 0.0
+    first_music = int(np.where(head_music)[0][0])
+    last_music = int(np.where(tail_music)[0][-1])
 
     head_start = 0
-    if first_aud > 0:
-        cand = first_aud * blk  # 最初の可聴 block 先頭まで除去 (buffer0=限界)
+    if first_music > 0:
+        cand = first_music * blk
         if cand >= int(head_min_trim_s * sr):
             head_start = cand
 
     tail_end = n
-    if last_aud < nbk - 1:
-        cand = min(n, (last_aud + 1) * blk)  # 最後の可聴 block 末まで保持
+    if last_music < nbk - 1:
+        cand = min(n, (last_music + 1) * blk)
         if (n - cand) >= int(tail_min_trim_s * sr):
             tail_end = cand
 
@@ -872,8 +893,9 @@ def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=60.0, ref_pct=90.0,
             f"[trimdbg] n={n} sr={sr} nbk={nbk} ref={ref_db:.1f}dB "
             f"fh={floor_head:.1f}(d{head_drop_db}) "
             f"ft={floor_tail:.1f}(d{tail_drop_db}) "
-            f"first_aud={first_aud}blk({first_aud*blk/sr*1000:.0f}ms) "
-            f"last_aud={last_aud} "
+            f"grad_thr={grad_thr_db_per_ms}dB/ms sm={sm}blk "
+            f"first_music={first_music}blk({first_music*blk/sr*1000:.0f}ms) "
+            f"last_music={last_music} "
             f"head_start={head_start}({head_start/sr*1000:.0f}ms) "
             f"tail_end=n-{(n-tail_end)/sr:.3f}s\n")
     if (tail_end - head_start) < int(min_content_s * sr):
