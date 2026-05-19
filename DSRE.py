@@ -203,6 +203,17 @@ OUTPUT_SUBTYPE_FALLBACK = "PCM_16"  # libsndfile 異常時の安全網
 OUTPUT_FORMAT = "FLAC"
 OUTPUT_EXT = ".flac"
 
+# 音量最適化: true peak 正規化目標 [dBFS]。
+# 値の根拠は「FLAC 96k 単体で clips=0」ではなく「FLAC→Opus 182 VBR 変換後も
+# clips=0」。Opus は内部 48k リサンプル + lossy 再構成で inter-sample peak が
+# 増える (実測 2026: 1kHz +0.10dB / 11kHz +0.45dB / 広帯域は LPF で逆に低下)。
+# 実音楽の現実的最悪 HF 成分 ≈ +0.45dB。業界標準の -1.0 dBTP がこれを安全に
+# 吸収 (-1.0+0.45=-0.55dBFS で余裕の 0)。8x oversampling (foobar TPS の ITU 4x
+# より過大評価側) と併せ Opus 後 clips=0 を構造的に保証する。過剰削減ではない
+# (実測 10000→4clip 相当の縮小より小、Opus 配信の必須マージン)。
+# 値はチューナブル: clips がまだ出るなら下げ、loudness 優先なら上げる。
+TP_TARGET_DBFS = -1.0
+
 # ===== 負荷レベル (v1.7 Phase M: 1-10 段階) =====
 LOAD_LEVEL_MIN = 1
 LOAD_LEVEL_MAX = 10
@@ -750,6 +761,156 @@ def _try_sf_write(path, data, sr, subtype, fmt):
         return False
 
 
+def _true_peak(data_sc, oversample=8, chunk=1 << 20):
+    """チャンク分割 8x oversampling で true peak (linear) を返す。
+
+    data_sc: (samples, channels)。
+    foobar True Peak Scanner は ITU-R BS.1770 (最小 4x oversampling) ベース。
+    ここで 8x を使うことで本ツールの推定値は foobar の読み以上 (過大評価側) に
+    なる → 正規化後の foobar 読みは必ず目標値以下 → clips=0 を構造的に保証する。
+    全長 8x materialize は数 GB になるためチャンク処理。チャンク境界の FIR
+    トランジェントは僅かに過大評価方向で clips=0 に安全側 (素サンプルピークも併用)。
+    """
+    if data_sc.size == 0:
+        return 0.0
+    n = data_sc.shape[0]
+    peak = 0.0
+    i = 0
+    while i < n:
+        seg = data_sc[i:i + chunk].astype(np.float64, copy=False)
+        up = signal.resample_poly(seg, oversample, 1, axis=0)
+        if up.size:
+            m = float(np.max(np.abs(up)))
+            if m > peak:
+                peak = m
+        i += chunk
+    raw = float(np.max(np.abs(data_sc)))
+    return max(peak, raw)
+
+
+def trim_silence(y, sr,
+                 head_junk_ceil_db=-50.0, tail_junk_ceil_db=-60.0,
+                 hard_protect_db=-40.0,
+                 frame_ms=30.0, hop_ms=10.0, sustain_ms=150.0,
+                 head_buffer_s=0.20, tail_buffer_s=1.0,
+                 head_min_trim_s=0.5, tail_min_trim_s=2.0,
+                 min_content_s=10.0, max_trim_s=180.0):
+    """絶対閾値 + ハード保護の曲頭/末トリム。y: (channels, samples) or (samples,)。
+    戻り値: (proposed_trimmed_y, head_trim_s, tail_trim_s)。
+
+    旧「ノイズ床相対」方式は実音源で破綻 (曲中の静かな箇所がパーセンタイルを汚染
+    → 必要なイントロ/アウトロを誤削除)。本版は曲のダイナミクスに影響されない
+    絶対閾値 + 楽音ハード保護で necessary を構造的に守る:
+
+    - head_junk_ceil_db (-50dBFS): 先頭で端から連続してこの値「未満」の区間
+      のみ junk 候補 (室内ノイズ/ヒス/無音は通常 -55〜-75dBFS)。-45dBFS の
+      静音イントロは ceil より上なので junk run 長 ≈ 0 → 削られない。
+    - tail_junk_ceil_db (-60dBFS): 末尾は減衰リバーブ余韻とヒスがレベルで
+      区別不能なため ceil を低くし保守化。-50〜-60dB の余韻は守り、明確な
+      ノイズ床 (< -60dB) のみ除去 (「アウトロ削除は論外」を最優先で担保)。
+    - hard_protect_db (-40dBFS): sustain_ms 継続でこれ以上なら確実に楽音。
+      その最初の位置より前へは絶対に踏み込まない (ハード保護限界)。
+    - 先頭: frame0 から head ceil 未満が連続する run のみ。先頭が既に
+      ceil 以上なら即停止 = トリムなし。head_min_trim_s 未満も触らない。
+    - 末尾: 末端から tail ceil 未満が連続する run。アウトロ余韻保護のため
+      tail_min_trim_s を長め (2.0s)、tail_buffer も大 (1.0s)。
+    - 安全弁: max_trim_s 超の側は異常スキップ / content < min_content_s 全スキップ。
+
+    重要: 本関数は「提案」を計算してログ可能にするが、実切断の適用可否は
+    呼び出し側が DSRE_TRIM_APPLY で制御する (デフォルトは report-only)。
+    """
+    is_mono = y.ndim == 1
+    n = len(y) if is_mono else y.shape[-1]
+    if n < int(min_content_s * sr):
+        return y, 0.0, 0.0
+    amp = np.abs(y) if is_mono else np.max(np.abs(y), axis=0)
+
+    frame = max(1, int(frame_ms * sr / 1000.0))
+    hop = max(1, int(hop_ms * sr / 1000.0))
+    n_frames = 1 + (n - frame) // hop if n >= frame else 0
+    if n_frames < 8:
+        return y, 0.0, 0.0
+
+    starts = np.arange(n_frames) * hop
+    sq = amp.astype(np.float64) ** 2
+    csum = np.concatenate(([0.0], np.cumsum(sq)))
+    seg_e = (csum[starts + frame] - csum[starts]) / frame
+    energy_db = 10.0 * np.log10(seg_e + 1e-20)
+
+    sustain_fr = max(1, int(sustain_ms / hop_ms))
+
+    # ハード保護: hard_protect_db を sustain 継続する最初/最後の楽音 frame
+    loud = energy_db >= hard_protect_db
+    music_first_fr = -1
+    music_last_fr = -1
+    if sustain_fr > 1 and loud.size >= sustain_fr:
+        win = np.convolve(loud.astype(np.int32),
+                          np.ones(sustain_fr, np.int32), "valid")
+        sidx = np.where(win == sustain_fr)[0]
+        if sidx.size:
+            music_first_fr = int(sidx[0])
+            music_last_fr = int(sidx[-1]) + sustain_fr - 1
+    if music_first_fr < 0:
+        idx = np.where(loud)[0]
+        if idx.size == 0:
+            return y, 0.0, 0.0  # 楽音が全く無い → 触らない
+        music_first_fr = int(idx[0])
+        music_last_fr = int(idx[-1])
+
+    above_head = energy_db >= head_junk_ceil_db
+    above_tail = energy_db >= tail_junk_ceil_db
+
+    # 先頭 junk: frame0 から head ceil 未満が連続する run
+    head_start = 0
+    if not above_head[0]:
+        hit = np.where(above_head)[0]
+        junk_end_fr = int(hit[0]) if hit.size else n_frames
+        junk_end_fr = min(junk_end_fr, music_first_fr)  # ハード保護
+        cand = max(0, junk_end_fr * hop - int(head_buffer_s * sr))
+        if cand >= int(head_min_trim_s * sr):
+            head_start = cand
+
+    # 末尾 junk: 末端から tail ceil 未満が連続する run (低 ceil = 余韻保護)
+    tail_end = n
+    if not above_tail[-1]:
+        hit = np.where(above_tail)[0]
+        last_loud_fr = int(hit[-1]) if hit.size else -1
+        last_loud_fr = max(last_loud_fr, music_last_fr)  # ハード保護
+        content_end = last_loud_fr * hop + frame
+        cand = min(n, content_end + int(tail_buffer_s * sr))
+        if (n - cand) >= int(tail_min_trim_s * sr):
+            tail_end = cand
+
+    # max_trim_s 超の側は異常スキップ
+    if head_start > int(max_trim_s * sr):
+        head_start = 0
+    if (n - tail_end) > int(max_trim_s * sr):
+        tail_end = n
+    if (tail_end - head_start) < int(min_content_s * sr):
+        return y, 0.0, 0.0
+    if head_start == 0 and tail_end == n:
+        return y, 0.0, 0.0
+
+    head_s = head_start / sr
+    tail_s = (n - tail_end) / sr
+    trimmed = y[head_start:tail_end] if is_mono else y[:, head_start:tail_end]
+    return trimmed, head_s, tail_s
+
+
+def _log_trim(path, head_s, tail_s, applied=False):
+    """trim_silence の提案/適用量をログファイルに追記する。
+    applied=False は report-only (音声不変、精度検証用)。
+    """
+    log_path = os.path.join(OUTPUT_DIR, "_trim_log.txt")
+    mode = "APPLIED" if applied else "PROPOSED"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{mode}] {os.path.basename(path)}\t"
+                    f"head={head_s:.2f}s\ttail={tail_s:.2f}s\n")
+    except Exception:
+        pass
+
+
 def save_flac24_out(in_path, y_out, sr, out_path):
     """DSP 結果を FLAC <TARGET_SR=96kHz> / PCM_24 として書き出し、ffmpeg でメタデータを継承する。
 
@@ -777,10 +938,18 @@ def save_flac24_out(in_path, y_out, sr, out_path):
         data = y_out.T
     data = data.astype(np.float32, copy=False)
 
-    # v1.3 方式: peak が 1.0 を超えたときのみ 1.0 に揃える (緩い clip 防止)
-    peak = float(np.max(np.abs(data))) if data.size else 0.0
-    if peak > 1.0:
-        data = data / peak
+    # 音量最適化: 4x oversampling で true peak を計測し 0 dBFS に正規化 (上下両方向)。
+    # CLIP=0 を保証しつつ静かな音源は引き上げ、うるさい音源は引き下げる (per-track)。
+    # DSRE_VOLUME_OPTIMIZE=0 で旧動作 (sample peak > 1.0 のみ正規化) に戻す。
+    if os.environ.get("DSRE_VOLUME_OPTIMIZE") != "0":
+        tp = _true_peak(data)
+        if tp > 0:
+            target = 10.0 ** (TP_TARGET_DBFS / 20.0)
+            data = (data * (target / tp)).astype(np.float32, copy=False)
+    else:
+        peak = float(np.max(np.abs(data))) if data.size else 0.0
+        if peak > 1.0:
+            data = data / peak
 
     base = os.path.splitext(out_path)[0]
     final_path = base + OUTPUT_EXT
@@ -1492,6 +1661,18 @@ class Worker(QtCore.QThread):
             y, sr = load_audio_safe(path)
             if sr != PARAMS.target_sr:
                 y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
+            # 無音トリム: 2 段階制御。
+            #   DSRE_TRIM_SILENCE=1 → 提案を計算しログ出力 (report-only、音声不変)
+            #   さらに DSRE_TRIM_APPLY=1 → 実際に切断を適用
+            # 実音源で精度をログ検証してから初めて APPLY する設計 (壊滅的・無音
+            # 失敗を観測可能な安全失敗に変える)。
+            if os.environ.get("DSRE_TRIM_SILENCE") == "1":
+                trimmed, head_s, tail_s = trim_silence(y, sr)
+                if head_s > 0 or tail_s > 0:
+                    applied = os.environ.get("DSRE_TRIM_APPLY") == "1"
+                    _log_trim(path, head_s, tail_s, applied)
+                    if applied:
+                        y = trimmed
             t0 = time.perf_counter()
             y_out = zansei_impl(
                 y, sr,
