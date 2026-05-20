@@ -788,10 +788,13 @@ def _true_peak(data_sc, oversample=8, chunk=1 << 20):
     return max(peak, raw)
 
 
-def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=40.0,
-                 grad_thr_db_per_ms=0.005, smooth_ms=3.0, ref_pct=90.0,
-                 blk_ms=1.0, head_min_trim_s=0.02, tail_min_trim_s=0.02,
-                 min_content_s=1.0, max_trim_s=180.0):
+def trim_silence(y, sr, head_floor_dbfs=-55.0, tail_floor_dbfs=-55.0,
+                 grad_thr_db_per_ms=0.005, smooth_ms=3.0, sustain_ms=50.0,
+                 gap_fill_ms=100.0, min_actual_music_ms=50.0, blk_ms=1.0,
+                 head_min_trim_s=0.02, tail_min_trim_s=0.02,
+                 min_content_s=1.0, max_trim_s=180.0,
+                 # 旧 API 互換 (trim_probe.py 用、無視される)
+                 head_drop_db=None, tail_drop_db=None, ref_pct=None):
     """『通常音量で知覚されない曲頭/曲末』を限界まで除去 (level+gradient 知覚モデル)。
     y: (channels, samples) or (samples,)。戻り: (trimmed_y, head_s, tail_s)。
 
@@ -814,14 +817,29 @@ def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=40.0,
 
     変数:
       blk_db    = 1ms 毎 peak dBFS (Audacity 波形目視と一致)
-      ref_db    = blk_db の 90 パーセンタイル (本体プログラムレベル)
       smooth_db = blk_db の smooth_ms 移動平均 (単 block ノイズ除去)
       grad      = |diff(smooth_db)| dB/ms (フェード/エッジ検出)
-      head/tail_drop_db: level floor (ref からの相対深さ、各 40dB)。gradient が
-        フェード/decay を保護するので tail 非対称不要 (旧 60→40 に均一化)
+      head/tail_floor_dbfs: **絶対 dBFS floor** (各 -55dBFS)。
+        ref-相対 floor は dynamic range の広い曲で破綻 (静かな曲部分が
+        floor 以下になり silence 誤判定。Your Seraphim 静か曲部分破壊事件
+        2026-05-20 → 絶対 floor で解決)。通常音量での可聴閾は ~-55dBFS
+        付近のため絶対化が知覚モデルに整合
       grad_thr_db_per_ms=0.005: 0.005dB/ms 以上の変化 = 音楽。極遅 fade
         (5dB/sec) まで保護。digital silence (grad≈0) のみ trim 対象
       smooth_ms=3: 単 block 跳ね除去 + エッジ検出力維持の均衡
+      sustain_ms=50: 音楽判定に N=50 連続 block 必要。単発 PCM blip や
+        孤立アーティファクトを除外しつつ、フェードイン/sharp music は通過
+        (5月17日事件 2026-05-20: 静音中の単発 -84dB blip が grad ジャンプで
+        誤検出され head 削れず → sustain 要件で解決)
+      gap_fill_ms=100: 内部短小 silence run (<100ms) を music で埋める
+        (morphological closing)。離散パルス型 fade-in (Your Seraphim:
+        231/233/235/276/280/288/291/295... と単発が増えるタイプ) を sustain
+        が貫通できず fade 後半まで cut してしまう問題を解決。本物の長い
+        silence (>100ms) は edge も内部も影響なし
+      min_actual_music_ms=50: gap-fill 後の各 music 領域に「実 music block
+        (gap-fill 前) が N=50ms 以上含まれる」検証。blip cluster (5月17日:
+        13/16/51/54/71/74ms に 6個 blip) が gap-fill で偽 music 領域化する
+        のを排除しつつ、本物 fade (Your Seraphim: 数百 block 実 music) は通過
 
     重要: 本関数は提案を計算 + 切断のみ。呼び出し側で常時 apply。
     """
@@ -839,9 +857,16 @@ def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=40.0,
     blk_peak = amp[:nbk * blk].reshape(nbk, blk).max(axis=1)
     blk_db = 20.0 * np.log10(blk_peak + 1e-12)
 
-    ref_db = float(np.percentile(blk_db, ref_pct))
-    floor_head = ref_db - head_drop_db
-    floor_tail = ref_db - tail_drop_db
+    # 旧 API (head_drop_db/tail_drop_db) を絶対 floor に変換 (互換層)
+    # ref_db を最大ピーク基準にし、drop_db を引いて絶対 floor 化
+    if head_drop_db is not None or tail_drop_db is not None:
+        ref_db = float(blk_db.max())  # 最大ピーク基準 (= ~0dBFS の曲が多い)
+        if head_drop_db is not None:
+            head_floor_dbfs = ref_db - head_drop_db
+        if tail_drop_db is not None:
+            tail_floor_dbfs = ref_db - tail_drop_db
+    floor_head = head_floor_dbfs
+    floor_tail = tail_floor_dbfs
 
     # Centered moving-average smoothing (cumsum O(N) implementation)
     sm = max(1, int(round(smooth_ms / blk_ms)))
@@ -865,12 +890,58 @@ def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=40.0,
     nonstationary = grad >= grad_thr_db_per_ms
     head_silence = (smooth_db < floor_head) & ~nonstationary
     tail_silence = (smooth_db < floor_tail) & ~nonstationary
+
+    # Gap-fill + 実 music 検証 (blip cluster false positive 防止):
+    # 1. 内部短小 silence run (<gap_fill_ms) を music 化 (fade pulse 連結)
+    # 2. 各 music 領域内の「gap-fill 前の実 music block」が
+    #    min_actual_music_ms 未満なら blip cluster 扱いで silence に戻す
+    gap_blk = max(1, int(round(gap_fill_ms / blk_ms)))
+    min_actual_blk = max(1, int(round(min_actual_music_ms / blk_ms)))
+
+    def _refine(sil_mask):
+        orig_sil = sil_mask.copy()
+        sil = sil_mask.copy()
+        # Pass 1: gap-fill 内部 silence run
+        diff = np.diff(np.concatenate([[False], sil, [False]]).astype(np.int8))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        for s, e in zip(starts, ends):
+            if s > 0 and e < nbk and (e - s) <= gap_blk:
+                sil[s:e] = False
+        # Pass 2: gap-fill 後の music 領域内で実 music 数を検証
+        mus = ~sil
+        diff2 = np.diff(np.concatenate([[False], mus, [False]]).astype(np.int8))
+        m_starts = np.where(diff2 == 1)[0]
+        m_ends = np.where(diff2 == -1)[0]
+        for s, e in zip(m_starts, m_ends):
+            # orig_sil[s:e] が True の数 = filled blocks。False = 実 music
+            actual_music = (~orig_sil[s:e]).sum()
+            if actual_music < min_actual_blk:
+                sil[s:e] = True  # blip cluster: 元に戻す
+        return sil
+
+    head_silence = _refine(head_silence)
+    tail_silence = _refine(tail_silence)
     head_music = ~head_silence
     tail_music = ~tail_silence
-    if not head_music.any() or not tail_music.any():
-        return y, 0.0, 0.0
-    first_music = int(np.where(head_music)[0][0])
-    last_music = int(np.where(tail_music)[0][-1])
+
+    # Sustain 要件: 単発 blip を除外
+    sustain_blk = max(1, int(round(sustain_ms / blk_ms)))
+    if sustain_blk > 1 and nbk > sustain_blk:
+        from numpy.lib.stride_tricks import sliding_window_view
+        wh = sliding_window_view(head_music, sustain_blk)
+        wt = sliding_window_view(tail_music, sustain_blk)
+        sus_head = wh.all(axis=1)
+        sus_tail = wt.all(axis=1)
+        if not sus_head.any() or not sus_tail.any():
+            return y, 0.0, 0.0
+        first_music = int(np.where(sus_head)[0][0])
+        last_music = int(np.where(sus_tail)[0][-1]) + sustain_blk - 1
+    else:
+        if not head_music.any() or not tail_music.any():
+            return y, 0.0, 0.0
+        first_music = int(np.where(head_music)[0][0])
+        last_music = int(np.where(tail_music)[0][-1])
 
     head_start = 0
     if first_music > 0:
@@ -889,11 +960,11 @@ def trim_silence(y, sr, head_drop_db=40.0, tail_drop_db=40.0,
     if (n - tail_end) > int(max_trim_s * sr):
         tail_end = n
     if os.environ.get("DSRE_TRIM_DEBUG") == "1":
+        sus_blk = max(1, int(round(sustain_ms / blk_ms)))
         sys.stderr.write(
-            f"[trimdbg] n={n} sr={sr} nbk={nbk} ref={ref_db:.1f}dB "
-            f"fh={floor_head:.1f}(d{head_drop_db}) "
-            f"ft={floor_tail:.1f}(d{tail_drop_db}) "
-            f"grad_thr={grad_thr_db_per_ms}dB/ms sm={sm}blk "
+            f"[trimdbg] n={n} sr={sr} nbk={nbk} "
+            f"fh={floor_head:.1f}dBFS ft={floor_tail:.1f}dBFS "
+            f"grad_thr={grad_thr_db_per_ms}dB/ms sm={sm}blk sus={sus_blk}blk "
             f"first_music={first_music}blk({first_music*blk/sr*1000:.0f}ms) "
             f"last_music={last_music} "
             f"head_start={head_start}({head_start/sr*1000:.0f}ms) "
