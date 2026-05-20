@@ -7,6 +7,10 @@ import tempfile
 import subprocess
 import configparser
 import functools
+import threading
+import datetime
+import shutil
+import traceback as _traceback
 from dataclasses import dataclass
 
 import numpy as np
@@ -722,6 +726,44 @@ def run_hidden(cmd):
     )
 
 
+def run_hidden_cancellable(cmd, register=None, unregister=None, poll_interval=0.1):
+    """run_hidden の中断可能版。Popen を起動して register に渡し、完了まで wait。
+    abort で外部から terminate/kill されたとき、戻り値 returncode != 0 を例外化する。
+
+    register(p): worker レジストリに登録
+    unregister(p): 完了時に外す (例外時も finally で必ず外す)
+
+    戻り値: subprocess.CompletedProcess 相当 (returncode のみ)。失敗時 CalledProcessError。
+    """
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if register is not None:
+        try:
+            register(p)
+        except Exception:
+            pass
+    try:
+        # poll ループで wait する (KeyboardInterrupt 等にも応答するため)
+        while True:
+            rc = p.poll()
+            if rc is not None:
+                break
+            time.sleep(poll_interval)
+        if rc != 0:
+            raise subprocess.CalledProcessError(rc, cmd)
+        return rc
+    finally:
+        if unregister is not None:
+            try:
+                unregister(p)
+            except Exception:
+                pass
+
+
 # ===== 安全読み込み =====
 def load_audio_safe(path):
     try:
@@ -994,7 +1036,7 @@ def _log_trim(path, head_s, tail_s, applied=False):
         pass
 
 
-def save_flac24_out(in_path, y_out, sr, out_path):
+def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister_proc=None):
     """DSP 結果を FLAC <TARGET_SR=96kHz> / PCM_24 として書き出し、ffmpeg でメタデータを継承する。
 
     v1.6 で 96kHz に戻し (理由):
@@ -1045,9 +1087,19 @@ def save_flac24_out(in_path, y_out, sr, out_path):
             wrote = True
             break
     if not wrote:
+        # 残骸を消してから例外
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         raise RuntimeError(f"FLAC 書込失敗 (PCM_24 / PCM_16 共に NG): {final_path}")
 
-    # ffmpeg でメタデータ継承 (音声は -c copy で再エンコード無し = 完全無劣化)
+    # ffmpeg を「final_path への直書き」ではなく **tmp_out_path** へ書き、
+    # 検証後に atomic os.replace で final_path に確定する。
+    # 直書きしていた旧実装は、ffmpeg がクラッシュ/中断した時に final_path に
+    # 壊れたファイルを残し、呼出側の send2trash で元音源が消える事故になり得た。
+    tmp_out_path = final_path + ".tmp_out.flac"
     cmd = [
         "ffmpeg", "-y",
         "-i", tmp_path,     # 音声ソース (DSP 済 FLAC)
@@ -1055,23 +1107,139 @@ def save_flac24_out(in_path, y_out, sr, out_path):
         "-map", "0:a",
         "-map_metadata", "1",
         "-c", "copy",
-        final_path,
+        tmp_out_path,
     ]
+    ffmpeg_ok = False
     try:
-        run_hidden(cmd)
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+        run_hidden_cancellable(cmd, register=register_proc, unregister=unregister_proc)
+        ffmpeg_ok = True
     except Exception:
-        # ffmpeg 失敗時はメタ無しで確定 (音声は確保されている)
+        # ffmpeg 失敗/中断: メタ無しでも音声本体 (tmp_path) は確保されている
+        # → メタ無しのまま tmp_out_path にしておく
         try:
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            os.replace(tmp_path, final_path)
+            if os.path.exists(tmp_out_path):
+                os.remove(tmp_out_path)
         except OSError:
             pass
+        try:
+            # tmp_path をそのまま tmp_out_path にする (メタなし FLAC)
+            os.replace(tmp_path, tmp_out_path)
+            ffmpeg_ok = True  # メタ無しだが音声は OK
+        except OSError:
+            ffmpeg_ok = False
+
+    # メタ取込が成功していれば tmp_path を片付ける
+    try:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except OSError:
+        pass
+
+    if not ffmpeg_ok:
+        raise RuntimeError(f"FLAC 出力確定失敗: {final_path}")
+
+    # 検証 gate (tmp_out_path の中身が壊れていないか)
+    ok, reason = _verify_output_file(tmp_out_path, data, sr)
+    if not ok:
+        # 壊れた tmp_out は捨てる、final_path は触らない
+        try:
+            os.remove(tmp_out_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"出力検証失敗 ({reason}): {final_path}")
+
+    # 検証 OK → atomic 置換で final_path に確定
+    try:
+        os.replace(tmp_out_path, final_path)
+    except OSError as e:
+        try:
+            os.remove(tmp_out_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"final_path 置換失敗 ({e}): {final_path}")
+
     return final_path
+
+
+def _verify_output_file(out_path: str, ref_data: np.ndarray, ref_sr: int) -> tuple[bool, str]:
+    """出力 FLAC が ref_data (DSP 出力配列, shape=(N, ch)) と整合するかを検証。
+
+    検査項目:
+      - sf.info で読める (FLAC ヘッダ健全性)
+      - sample rate が一致
+      - channel 数が一致
+      - frames が一致 (FLAC 無劣化なので bit-exact 一致を要求)
+      - 先頭最大 1 秒をロードして RMS > 1e-7 (完全無音でない)
+      - peak < 0.9999999 (true peak clipping を疑う水準より下)
+
+    DSP 出力 ref_data が無音である正当ケースは想定外 (zansei_impl は何かしら載せる)。
+    無音検出は「ffmpeg/sf がエラー時に空ファイル/全0 を書いた」事故の検出が目的。
+    """
+    try:
+        info = sf.info(out_path)
+    except Exception as e:
+        return False, f"info読込失敗:{type(e).__name__}"
+
+    if info.samplerate != int(ref_sr):
+        return False, f"sr不一致:got{info.samplerate} exp{ref_sr}"
+
+    exp_channels = int(ref_data.shape[1]) if ref_data.ndim == 2 else 1
+    if info.channels != exp_channels:
+        return False, f"ch不一致:got{info.channels} exp{exp_channels}"
+
+    exp_frames = int(ref_data.shape[0])
+    if info.frames != exp_frames:
+        return False, f"frames不一致:got{info.frames} exp{exp_frames}"
+
+    # 内容検査: 先頭 1 秒で RMS / peak
+    try:
+        n_read = int(min(info.frames, info.samplerate))
+        with sf.SoundFile(out_path) as f:
+            sample = f.read(n_read, dtype="float32", always_2d=True)
+    except Exception as e:
+        return False, f"sample読込失敗:{type(e).__name__}"
+
+    if sample.size == 0:
+        return False, "sample空"
+    rms = float(np.sqrt(np.mean(sample.astype(np.float64) ** 2)))
+    if not np.isfinite(rms):
+        return False, "RMS非有限(NaN/Inf)"
+    if rms < 1e-7:
+        return False, f"出力ほぼ無音:rms={rms:.2e}"
+    peak = float(np.max(np.abs(sample)))
+    if not np.isfinite(peak):
+        return False, "peak非有限(NaN/Inf)"
+    if peak >= 0.9999999:
+        return False, f"clip疑い:peak={peak:.7f}"
+
+    return True, "ok"
+
+
+_FAILURE_LOG_LOCK = threading.Lock()
+
+
+def _failure_log_path() -> str:
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base or os.getcwd(), "dsre_failures.log")
+
+
+def _log_failure(path: str, reason: str, exc: BaseException | None = None) -> None:
+    """失敗イベントを dsre_failures.log に追記する。UI カウンタとは別経路の詳細監査ログ。"""
+    log_path = _failure_log_path()
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [f"[{ts}] reason={reason}  file={path}"]
+    if exc is not None:
+        lines.append(f"  exc={type(exc).__name__}: {exc}")
+        tb = "".join(_traceback.format_exception(type(exc), exc, exc.__traceback__))
+        for ln in tb.rstrip("\n").splitlines():
+            lines.append(f"    {ln}")
+    msg = "\n".join(lines) + "\n"
+    try:
+        with _FAILURE_LOG_LOCK:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg)
+    except Exception:
+        pass
 
 
 # ===== DSP =====
@@ -1661,6 +1829,29 @@ class _NullCtx:
         return False
 
 
+class _AbortedError(Exception):
+    """中断シグナルを stage 境界から呼び出し元へ伝播させる内部例外。"""
+    pass
+
+
+def _cleanup_leftover_tmp(directory: str) -> int:
+    """前回クラッシュ等で残った *.tmp_src.flac / *.tmp_out.flac を掃除して件数を返す。"""
+    if not os.path.isdir(directory):
+        return 0
+    n = 0
+    try:
+        for name in os.listdir(directory):
+            if name.endswith(".tmp_src.flac") or name.endswith(".tmp_out.flac"):
+                try:
+                    os.remove(os.path.join(directory, name))
+                    n += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return n
+
+
 # ===== Worker =====
 class Worker(QtCore.QThread):
     sig_step = QtCore.Signal(int)
@@ -1676,10 +1867,14 @@ class Worker(QtCore.QThread):
         self._wait = QtCore.QWaitCondition()
         self._failed: list[str] = []
         self._trash_failed = 0
+        self._verify_failed = 0
+        self._aborted_files = 0
         self._level = max(LOAD_LEVEL_MIN, min(LOAD_LEVEL_MAX, int(level)))
-        import threading as _t
-        self._level_lock = _t.Lock()
-        self._trash_lock = _t.Lock()
+        self._level_lock = threading.Lock()
+        self._trash_lock = threading.Lock()
+        # 子プロセス (ffmpeg 等) レジストリ。abort/closeEvent から terminate する。
+        self._procs_lock = threading.Lock()
+        self._active_procs: set = set()
 
     def set_level(self, lv: int) -> None:
         """処理中にリアルタイムで負荷レベルを変更する。次のファイルから反映。"""
@@ -1695,6 +1890,44 @@ class Worker(QtCore.QThread):
         self._abort = True
         self._wait.wakeAll()
         self._mutex.unlock()
+        # 進行中の ffmpeg 子プロセスを即 terminate (in-thread の librosa/resampy/sf.write は
+        # 別スレッドから止められないが、ffmpeg は最も長く blocking しがちなので最優先で殺す)
+        self.kill_all_procs(grace=0.5)
+
+    # ---- 子プロセス管理 (run_hidden_cancellable の register/unregister 受け口) ----
+    def register_proc(self, p) -> None:
+        with self._procs_lock:
+            self._active_procs.add(p)
+
+    def unregister_proc(self, p) -> None:
+        with self._procs_lock:
+            self._active_procs.discard(p)
+
+    def kill_all_procs(self, grace: float = 0.5) -> None:
+        """登録済の全子プロセスに terminate → grace 秒待って残れば kill。"""
+        with self._procs_lock:
+            procs = list(self._active_procs)
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+        deadline = time.time() + max(0.0, grace)
+        for p in procs:
+            try:
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    p.wait(timeout=remaining)
+                else:
+                    p.poll()
+            except Exception:
+                pass
+            try:
+                if p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
 
     def pause_toggle(self):
         self._mutex.lock()
@@ -1722,6 +1955,13 @@ class Worker(QtCore.QThread):
         succeeded = 0
         completed_count = 0
 
+        # 起動時 cleanup: 前回クラッシュ/強制終了で残った tmp_src/tmp_out を一掃。
+        # 残骸があると同じ basename で連続実行時に sf.write が混乱する可能性を防ぐ。
+        try:
+            _cleanup_leftover_tmp(OUTPUT_DIR)
+        except Exception:
+            pass
+
         # run() 開始時の level で BLAS スレッド数とnumba を初期設定
         lv_init = self._get_level()
         n_thr_init = _blas_threads(lv_init)
@@ -1734,14 +1974,41 @@ class Worker(QtCore.QThread):
         outer_ctx = _tpl(**kw_init) if kw_init else _NullCtx()
 
         def _process_one(path: str, lv: int, use_step_cb: bool) -> str:
-            """単一ファイルを処理して "ok" / "trash_fail" を返す。"""
+            """単一ファイルを処理して結果コードを返す。
+
+            戻り値:
+              "ok"           : 処理成功 + 検証 OK + 元ファイル trash 成功
+              "trash_fail"   : 出力 OK だが send2trash 失敗 (元ファイルは無事に残っている)
+              "aborted"      : 中断 (どの段階でも、元ファイルは消されない)
+              "verify_fail"  : 出力検証 NG (壊れた出力は捨てられ、元ファイルは残る)
+              "disk_short"   : ディスク容量不足のため未着手 (元ファイル無事)
+              例外           : run() 側で "失敗" カウンタへ
+            """
             par = _resampy_parallel(lv)
 
             def step_cb(cur, m):
                 if use_step_cb:
                     self.sig_step.emit(int(cur * 100 / m))
 
+            def _check_abort():
+                if self._abort:
+                    raise _AbortedError(path)
+
+            # ---- 事前: ディスク空き確認 (入力 size × 4 倍を要求、96k FLAC 拡張余裕込み) ----
+            try:
+                in_size = os.path.getsize(path)
+                du = shutil.disk_usage(OUTPUT_DIR)
+                if du.free < max(in_size * 4, 50 * 1024 * 1024):
+                    _log_failure(path, "disk_short",
+                                 RuntimeError(f"free={du.free} in_size={in_size}"))
+                    return "disk_short"
+            except OSError:
+                pass  # 失敗しても致命ではない、本処理へ
+
+            _check_abort()
             y, sr = load_audio_safe(path)
+            _check_abort()
+
             # 無音トリムは **リサンプル前の元音声** に適用 (アップサンプルは
             # 無音→音楽ハード edit に FIR プリリンギングを滲ませ境界を不正確に
             # するため。実測確定)。常時 apply。DSRE_TRIM_SILENCE=0 で無効化。
@@ -1750,8 +2017,12 @@ class Worker(QtCore.QThread):
                 if head_s > 0 or tail_s > 0:
                     _log_trim(path, head_s, tail_s, applied=True)
                     y = trimmed
+            _check_abort()
+
             if sr != PARAMS.target_sr:
                 y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
+            _check_abort()
+
             t0 = time.perf_counter()
             y_out = zansei_impl(
                 y, sr,
@@ -1759,18 +2030,44 @@ class Worker(QtCore.QThread):
                 abort_cb=lambda: self._abort,
             )
             proc_time = time.perf_counter() - t0
+            _check_abort()  # zansei が abort_cb 経由で途中終了した可能性あり、ここで弾く
+
             out = os.path.join(OUTPUT_DIR, os.path.basename(path))
-            save_flac24_out(path, y_out, sr, out)
-            AudioMetricsLogger.log(
-                input_path=path,
-                input_audio=y,
-                output_audio=y_out,
-                sr=sr,
-                processing_time_sec=proc_time,
-            )
+            try:
+                save_flac24_out(
+                    path, y_out, sr, out,
+                    register_proc=self.register_proc,
+                    unregister_proc=self.unregister_proc,
+                )
+            except _AbortedError:
+                raise
+            except RuntimeError as e:
+                # save_flac24_out 内の検証 gate (verify_fail) もここで捕捉
+                msg = str(e)
+                if "出力検証失敗" in msg:
+                    _log_failure(path, "verify_fail", e)
+                    return "verify_fail"
+                _log_failure(path, "save_fail", e)
+                raise
+            _check_abort()
+
+            try:
+                AudioMetricsLogger.log(
+                    input_path=path,
+                    input_audio=y,
+                    output_audio=y_out,
+                    sr=sr,
+                    processing_time_sec=proc_time,
+                )
+            except Exception:
+                # メトリクス記録失敗は本処理を止めない (DB ロック等)
+                pass
+
+            # 出力が確定し検証も通った後、ここで初めて元ファイルを trash
             try:
                 send2trash(path)
-            except Exception:
+            except Exception as e:
+                _log_failure(path, "trash_fail", e)
                 return "trash_fail"
             return "ok"
 
@@ -1789,13 +2086,30 @@ class Worker(QtCore.QThread):
                             completed_count += 1
                             try:
                                 result = fut.result()
-                            except Exception:
+                            except _AbortedError:
+                                # 中断: 元ファイル無事、出力 tmp は save_flac24_out 内で除去済
+                                self._aborted_files += 1
+                            except Exception as e:
+                                # 想定外例外。失敗ログに詳細記録、UI には件数のみ
                                 self._failed.append(os.path.basename(fpath))
+                                _log_failure(fpath, "exception", e)
                             else:
-                                succeeded += 1
-                                if result == "trash_fail":
+                                if result == "ok":
+                                    succeeded += 1
+                                elif result == "trash_fail":
+                                    succeeded += 1  # 出力自体は OK
                                     with self._trash_lock:
                                         self._trash_failed += 1
+                                elif result == "verify_fail":
+                                    self._verify_failed += 1
+                                    self._failed.append(os.path.basename(fpath))
+                                elif result == "aborted":
+                                    self._aborted_files += 1
+                                elif result == "disk_short":
+                                    self._failed.append(os.path.basename(fpath))
+                                else:
+                                    # 未知 result: 安全側で failed 計上
+                                    self._failed.append(os.path.basename(fpath))
                             # 進捗テキスト更新
                             elapsed = time.time() - start_t
                             if completed_count > 0 and total > completed_count:
@@ -1804,6 +2118,8 @@ class Worker(QtCore.QThread):
                                 parts = []
                                 if fail_n:
                                     parts.append(f"失敗{fail_n}")
+                                if self._verify_failed:
+                                    parts.append(f"検証NG{self._verify_failed}")
                                 if self._trash_failed:
                                     parts.append(f"ゴミ箱{self._trash_failed}")
                                 suffix = ("  " + "  ".join(parts)) if parts else ""
@@ -1821,6 +2137,11 @@ class Worker(QtCore.QThread):
                     # ---- 一時停止 (新規投入前、QThread コンテキストで呼ぶ) ----
                     self._wait_if_paused()
                     if self._abort:
+                        # pending 全破棄 + 既出 future の cancel 試行 (実行中は止められない)
+                        try:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                        except Exception:
+                            pass
                         break
 
                     # ---- 現在の level に基づいてファイルを投入 ----
@@ -1838,12 +2159,21 @@ class Worker(QtCore.QThread):
 
         fail_n = len(self._failed)
         trash_n = self._trash_failed
+        verify_n = self._verify_failed
+        aborted_n = self._aborted_files
         extras = []
         if fail_n:
             extras.append(f"失敗{fail_n}")
+        if verify_n:
+            extras.append(f"検証NG{verify_n}")
         if trash_n:
             extras.append(f"ゴミ箱{trash_n}")
+        if aborted_n:
+            extras.append(f"中断{aborted_n}")
         tail = ("  " + "  ".join(extras)) if extras else ""
+        if fail_n or verify_n:
+            # 失敗があった場合は詳細ログ場所を促す
+            tail += f"  log:{_failure_log_path()}"
         if self._abort:
             self.sig_text.emit(f"中断  成功{succeeded}/{total}{tail}")
         elif extras:
@@ -1965,10 +2295,34 @@ class MainWindow(QtWidgets.QWidget):
                 self._show_from_tray()
 
     def _quit_app(self) -> None:
-        """トレイ「終了」および × ボタン共通の終了処理。確認ダイアログなし (ユーザー要望)。"""
+        """トレイ「終了」および × ボタン共通の終了処理。確認ダイアログなし (ユーザー要望)。
+
+        全プロセス即時終了を保証する: abort + 子プロセス kill + 短い wait → 残れば
+        os._exit(0) で強制終了。Python の thread は外部から kill 不可だが、プロセス
+        終了で全 thread/子プロセスは確実に道連れになる。
+        """
         if self.worker and self.worker.isRunning():
-            self.worker.abort()
-            self.worker.wait(3000)
+            try:
+                self.worker.abort()  # _abort=True + kill_all_procs (ffmpeg 即殺)
+            except Exception:
+                pass
+            try:
+                self.worker.wait(1500)  # in-thread の librosa/resampy/sf.write を 1.5s 待つ
+            except Exception:
+                pass
+            if self.worker.isRunning():
+                # まだ in-flight が残っている → 子プロセスを再度全 kill して os._exit
+                try:
+                    self.worker.kill_all_procs(grace=0.2)
+                except Exception:
+                    pass
+                if self._tray is not None:
+                    try:
+                        self._tray.hide()
+                    except Exception:
+                        pass
+                # 強制終了: プロセス自体を落とすことで全 thread/子プロセスを確実に止める
+                os._exit(0)
         if self._tray is not None:
             self._tray.hide()
         QtWidgets.QApplication.instance().quit()
