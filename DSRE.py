@@ -601,16 +601,19 @@ class AudioMetricsLogger:
         adaptive_layers=None,
         adaptive_mode=None,
         hf_ratio_input=None,
+        _before_metrics: "dict | None" = None,
+        _after_metrics: "dict | None" = None,
     ) -> None:
         """
         メトリクスを計算して DB に 1 行追記。例外は握り潰す（処理をブロックしない）。
         input_audio: 96k リサンプル済の処理前音声 (numpy array)
         output_audio: zansei_impl 処理後音声 (numpy array)
+        _before_metrics / _after_metrics: 事前計算済みの場合は MetricsComputer を再呼びしない。
         """
         try:
             import datetime
-            b = MetricsComputer.compute(input_audio, sr)
-            a = MetricsComputer.compute(output_audio, sr)
+            b = _before_metrics if _before_metrics is not None else MetricsComputer.compute(input_audio, sr)
+            a = _after_metrics if _after_metrics is not None else MetricsComputer.compute(output_audio, sr)
 
             if input_audio.ndim == 2:
                 channels = input_audio.shape[0]
@@ -669,6 +672,48 @@ class AudioMetricsLogger:
                 conn.commit()
         except Exception:
             pass  # ロガー失敗は処理結果に影響させない
+
+
+def _extract_flac_pictures(path: str) -> list:
+    """FLAC ファイルから PICTURE ブロックを mutagen で抽出する。失敗時は空リストを返す。"""
+    try:
+        from mutagen.flac import FLAC
+        return list(FLAC(path).pictures)
+    except Exception:
+        return []
+
+
+def _embed_output_metadata(
+    path: str,
+    pictures: list,
+    before_m: dict,
+    after_m: dict,
+    level: int,
+) -> None:
+    """処理済 FLAC に PICTURE ブロック + カスタム Vorbis Comment タグを埋め込む。失敗は握り潰す。"""
+    try:
+        import datetime
+        from mutagen.flac import FLAC
+        f = FLAC(path)
+        # PICTURE ブロック再注入 (元の順序で)
+        f.clear_pictures()
+        for pic in pictures:
+            f.add_picture(pic)
+        # カスタムタグ (小文字: FLAC Vorbis Comment 規約)
+        if f.tags is None:
+            f.add_tags()
+        f.tags["dsre_version"] = [_get_dsre_version()]
+        f.tags["dsre_processed_utc"] = [datetime.datetime.utcnow().isoformat()]
+        f.tags["dsre_level"] = [str(level)]
+        for k, v in before_m.items():
+            if v is not None:
+                f.tags[f"dsre_before_{k}"] = [str(round(float(v), 6))]
+        for k, v in after_m.items():
+            if v is not None:
+                f.tags[f"dsre_after_{k}"] = [str(round(float(v), 6))]
+        f.save()
+    except Exception:
+        pass  # メタデータ失敗は本処理をブロックしない
 
 
 # ===== バンドルリソースのパス解決 =====
@@ -1821,6 +1866,171 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     return result
 
 
+class MetricsTab(QtWidgets.QWidget):
+    """SQLite から音響メトリクスを読み込んで pyqtgraph で可視化するタブ。"""
+
+    _METRIC_LABELS = [
+        ("rms_db", "RMS (dBFS)"),
+        ("peak_db", "Peak (dBFS)"),
+        ("dr", "DR"),
+        ("plr", "PLR"),
+        ("lufs", "LUFS"),
+        ("lra", "LRA"),
+        ("clip_count", "Clip Count"),
+        ("centroid_hz", "Centroid (Hz)"),
+        ("rolloff_hz", "Rolloff (Hz)"),
+        ("flatness", "Flatness"),
+        ("hf_ratio_4k", "HF ratio >4kHz"),
+        ("hf_ratio_8k", "HF ratio >8kHz"),
+        ("hf_ratio_12k", "HF ratio >12kHz"),
+        ("hf_ratio_16k", "HF ratio >16kHz"),
+        ("harmonic_1k_proxy", "Harmonic proxy"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        try:
+            import pyqtgraph as pg
+            pg.setConfigOption("background", "#1e1e1e")
+            pg.setConfigOption("foreground", "#cccccc")
+            self._pg = pg
+        except ImportError:
+            self._pg = None
+
+        self._sub = QtWidgets.QTabWidget()
+
+        # --- 最新バッチタブ ---
+        batch_container = QtWidgets.QWidget()
+        batch_layout = QtWidgets.QVBoxLayout(batch_container)
+        self._metric_combo_batch = QtWidgets.QComboBox()
+        for key, label in self._METRIC_LABELS:
+            self._metric_combo_batch.addItem(label, key)
+        batch_layout.addWidget(self._metric_combo_batch)
+        if self._pg:
+            self._batch_plot = self._pg.PlotWidget()
+            batch_layout.addWidget(self._batch_plot)
+        else:
+            self._batch_plot = None
+            batch_layout.addWidget(QtWidgets.QLabel("pyqtgraph が必要です"))
+        self._sub.addTab(batch_container, "最新バッチ")
+
+        # --- 全履歴タブ ---
+        hist_container = QtWidgets.QWidget()
+        hist_layout = QtWidgets.QVBoxLayout(hist_container)
+        self._metric_combo_hist = QtWidgets.QComboBox()
+        for key, label in self._METRIC_LABELS:
+            self._metric_combo_hist.addItem(label, key)
+        hist_layout.addWidget(self._metric_combo_hist)
+        if self._pg:
+            self._hist_plot = self._pg.PlotWidget()
+            hist_layout.addWidget(self._hist_plot)
+        else:
+            self._hist_plot = None
+            hist_layout.addWidget(QtWidgets.QLabel("pyqtgraph が必要です"))
+        self._sub.addTab(hist_container, "全履歴")
+
+        btn_refresh = QtWidgets.QPushButton("更新")
+        btn_refresh.clicked.connect(self.refresh)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._sub)
+        layout.addWidget(btn_refresh)
+
+        self._metric_combo_batch.currentIndexChanged.connect(self._draw_batch)
+        self._metric_combo_hist.currentIndexChanged.connect(self._draw_hist)
+
+    def refresh(self) -> None:
+        self._draw_batch()
+        self._draw_hist()
+
+    def _load_batch(self, n: int = 50) -> list:
+        """直近 n 件のレコードを SQLite から取得。失敗時は空リスト。"""
+        try:
+            with sqlite3.connect(METRICS_DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (n,)
+                ).fetchall()
+                return [dict(r) for r in reversed(rows)]
+        except Exception:
+            return []
+
+    def _load_history(self, n: int = 500) -> list:
+        """全履歴 (最大 n 件) を取得。"""
+        try:
+            with sqlite3.connect(METRICS_DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY id ASC LIMIT ?", (n,)
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def _draw_batch(self) -> None:
+        if not self._pg or self._batch_plot is None:
+            return
+        key = self._metric_combo_batch.currentData()
+        if not key:
+            return
+        rows = self._load_batch()
+        before_key = f"{key}_b"
+        after_key = f"{key}_a"
+        before_vals = [r.get(before_key) for r in rows if r.get(before_key) is not None]
+        after_vals = [r.get(after_key) for r in rows if r.get(after_key) is not None]
+        n = min(len(before_vals), len(after_vals))
+        if n == 0:
+            self._batch_plot.clear()
+            return
+        x = list(range(n))
+        bar_width = 0.35
+        self._batch_plot.clear()
+        bg = self._pg.BarGraphItem(
+            x=[xi - bar_width / 2 for xi in x],
+            height=before_vals[:n],
+            width=bar_width,
+            brush="#607D8B",
+            name="Before",
+        )
+        ba = self._pg.BarGraphItem(
+            x=[xi + bar_width / 2 for xi in x],
+            height=after_vals[:n],
+            width=bar_width,
+            brush="#4CAF50",
+            name="After",
+        )
+        self._batch_plot.addItem(bg)
+        self._batch_plot.addItem(ba)
+        self._batch_plot.setLabel("bottom", "File index")
+        self._batch_plot.setLabel("left", self._metric_combo_batch.currentText())
+
+    def _draw_hist(self) -> None:
+        if not self._pg or self._hist_plot is None:
+            return
+        key = self._metric_combo_hist.currentData()
+        if not key:
+            return
+        rows = self._load_history()
+        before_key = f"{key}_b"
+        after_key = f"{key}_a"
+        before_vals = [r.get(before_key) for r in rows]
+        after_vals = [r.get(after_key) for r in rows]
+        xs = list(range(len(rows)))
+        self._hist_plot.clear()
+        b_clean = [(i, v) for i, v in zip(xs, before_vals) if v is not None]
+        a_clean = [(i, v) for i, v in zip(xs, after_vals) if v is not None]
+        if b_clean:
+            bx, by = zip(*b_clean)
+            self._hist_plot.plot(list(bx), list(by), pen="#607D8B", name="Before")
+        if a_clean:
+            ax, ay = zip(*a_clean)
+            self._hist_plot.plot(list(ax), list(ay), pen="#4CAF50", name="After")
+        self._hist_plot.setLabel("bottom", "Run index")
+        self._hist_plot.setLabel("left", self._metric_combo_hist.currentText())
+        legend = self._hist_plot.addLegend()
+        legend.setOffset((10, 10))
+
+
 class _NullCtx:
     def __enter__(self):
         return self
@@ -2007,6 +2217,7 @@ class Worker(QtCore.QThread):
 
             _check_abort()
             y, sr = load_audio_safe(path)
+            pictures = _extract_flac_pictures(path)
             _check_abort()
 
             # 無音トリムは **リサンプル前の元音声** に適用 (アップサンプルは
@@ -2023,6 +2234,8 @@ class Worker(QtCore.QThread):
                 y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
             _check_abort()
 
+            before_m = MetricsComputer.compute(y, sr)
+            _check_abort()
             t0 = time.perf_counter()
             y_out = zansei_impl(
                 y, sr,
@@ -2030,6 +2243,7 @@ class Worker(QtCore.QThread):
                 abort_cb=lambda: self._abort,
             )
             proc_time = time.perf_counter() - t0
+            after_m = MetricsComputer.compute(y_out, sr)
             _check_abort()  # zansei が abort_cb 経由で途中終了した可能性あり、ここで弾く
 
             out = os.path.join(OUTPUT_DIR, os.path.basename(path))
@@ -2049,6 +2263,10 @@ class Worker(QtCore.QThread):
                     return "verify_fail"
                 _log_failure(path, "save_fail", e)
                 raise
+            try:
+                _embed_output_metadata(out, pictures, before_m, after_m, lv)
+            except Exception:
+                pass
             _check_abort()
 
             try:
@@ -2058,6 +2276,8 @@ class Worker(QtCore.QThread):
                     output_audio=y_out,
                     sr=sr,
                     processing_time_sec=proc_time,
+                    _before_metrics=before_m,
+                    _after_metrics=after_m,
                 )
             except Exception:
                 # メトリクス記録失敗は本処理を止めない (DB ロック等)
@@ -2207,20 +2427,34 @@ class MainWindow(QtWidgets.QWidget):
         self.sld_level.setTickInterval(1)
         self.lbl_level = QtWidgets.QLabel(f"負荷 {_lv}/{LOAD_LEVEL_MAX}")
 
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.label)
-        layout.addWidget(self.pb_file)
-        layout.addWidget(self.pb_all)
-        layout.addWidget(self.btn_start)
-        layout.addWidget(self.btn_pause)
-        layout.addWidget(self.btn_cancel)
-
+        # ---- 処理タブ (既存UIを QWidget でラップ) ----
+        proc_widget = QtWidgets.QWidget()
+        proc_layout = QtWidgets.QVBoxLayout(proc_widget)
+        proc_layout.addWidget(self.label)
+        proc_layout.addWidget(self.pb_file)
+        proc_layout.addWidget(self.pb_all)
+        proc_layout.addWidget(self.btn_start)
+        proc_layout.addWidget(self.btn_pause)
+        proc_layout.addWidget(self.btn_cancel)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.lbl_level)
         row.addWidget(self.sld_level, 1)
-        layout.addLayout(row)
+        proc_layout.addLayout(row)
 
-        self.setLayout(layout)
+        # ---- グラフタブ ----
+        self.metrics_tab = MetricsTab()
+
+        # ---- タブウィジェット ----
+        self._tabs = QtWidgets.QTabWidget()
+        self._tabs.addTab(proc_widget, "処理")
+        self._tabs.addTab(self.metrics_tab, "グラフ")
+
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self._tabs)
+        self.setLayout(main_layout)
+
+        self.resize(400, 280)
 
         self.btn_start.clicked.connect(self.start)
         self.btn_pause.clicked.connect(self.pause)
@@ -2357,6 +2591,7 @@ class MainWindow(QtWidgets.QWidget):
         self.worker.sig_step.connect(self.pb_file.setValue)
         self.worker.sig_all.connect(self.pb_all.setValue)
         self.worker.sig_text.connect(self.label.setText)
+        self.worker.finished.connect(self.metrics_tab.refresh)
         self.worker.start()
 
     def pause(self):
