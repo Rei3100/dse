@@ -1866,6 +1866,171 @@ def zansei_impl(x, sr, progress_cb=None, abort_cb=None):
     return result
 
 
+class MetricsTab(QtWidgets.QWidget):
+    """SQLite から音響メトリクスを読み込んで pyqtgraph で可視化するタブ。"""
+
+    _METRIC_LABELS = [
+        ("rms_db", "RMS (dBFS)"),
+        ("peak_db", "Peak (dBFS)"),
+        ("dr", "DR"),
+        ("plr", "PLR"),
+        ("lufs", "LUFS"),
+        ("lra", "LRA"),
+        ("clip_count", "Clip Count"),
+        ("centroid_hz", "Centroid (Hz)"),
+        ("rolloff_hz", "Rolloff (Hz)"),
+        ("flatness", "Flatness"),
+        ("hf_ratio_4k", "HF ratio >4kHz"),
+        ("hf_ratio_8k", "HF ratio >8kHz"),
+        ("hf_ratio_12k", "HF ratio >12kHz"),
+        ("hf_ratio_16k", "HF ratio >16kHz"),
+        ("harmonic_1k_proxy", "Harmonic proxy"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        try:
+            import pyqtgraph as pg
+            pg.setConfigOption("background", "#1e1e1e")
+            pg.setConfigOption("foreground", "#cccccc")
+            self._pg = pg
+        except ImportError:
+            self._pg = None
+
+        self._sub = QtWidgets.QTabWidget()
+
+        # --- 最新バッチタブ ---
+        batch_container = QtWidgets.QWidget()
+        batch_layout = QtWidgets.QVBoxLayout(batch_container)
+        self._metric_combo_batch = QtWidgets.QComboBox()
+        for key, label in self._METRIC_LABELS:
+            self._metric_combo_batch.addItem(label, key)
+        batch_layout.addWidget(self._metric_combo_batch)
+        if self._pg:
+            self._batch_plot = self._pg.PlotWidget()
+            batch_layout.addWidget(self._batch_plot)
+        else:
+            self._batch_plot = None
+            batch_layout.addWidget(QtWidgets.QLabel("pyqtgraph が必要です"))
+        self._sub.addTab(batch_container, "最新バッチ")
+
+        # --- 全履歴タブ ---
+        hist_container = QtWidgets.QWidget()
+        hist_layout = QtWidgets.QVBoxLayout(hist_container)
+        self._metric_combo_hist = QtWidgets.QComboBox()
+        for key, label in self._METRIC_LABELS:
+            self._metric_combo_hist.addItem(label, key)
+        hist_layout.addWidget(self._metric_combo_hist)
+        if self._pg:
+            self._hist_plot = self._pg.PlotWidget()
+            hist_layout.addWidget(self._hist_plot)
+        else:
+            self._hist_plot = None
+            hist_layout.addWidget(QtWidgets.QLabel("pyqtgraph が必要です"))
+        self._sub.addTab(hist_container, "全履歴")
+
+        btn_refresh = QtWidgets.QPushButton("更新")
+        btn_refresh.clicked.connect(self.refresh)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._sub)
+        layout.addWidget(btn_refresh)
+
+        self._metric_combo_batch.currentIndexChanged.connect(self._draw_batch)
+        self._metric_combo_hist.currentIndexChanged.connect(self._draw_hist)
+
+    def refresh(self) -> None:
+        self._draw_batch()
+        self._draw_hist()
+
+    def _load_batch(self, n: int = 50) -> list:
+        """直近 n 件のレコードを SQLite から取得。失敗時は空リスト。"""
+        try:
+            with sqlite3.connect(METRICS_DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (n,)
+                ).fetchall()
+                return [dict(r) for r in reversed(rows)]
+        except Exception:
+            return []
+
+    def _load_history(self, n: int = 500) -> list:
+        """全履歴 (最大 n 件) を取得。"""
+        try:
+            with sqlite3.connect(METRICS_DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM runs ORDER BY id ASC LIMIT ?", (n,)
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def _draw_batch(self) -> None:
+        if not self._pg or self._batch_plot is None:
+            return
+        key = self._metric_combo_batch.currentData()
+        if not key:
+            return
+        rows = self._load_batch()
+        before_key = f"{key}_b"
+        after_key = f"{key}_a"
+        before_vals = [r.get(before_key) for r in rows if r.get(before_key) is not None]
+        after_vals = [r.get(after_key) for r in rows if r.get(after_key) is not None]
+        n = min(len(before_vals), len(after_vals))
+        if n == 0:
+            self._batch_plot.clear()
+            return
+        x = list(range(n))
+        bar_width = 0.35
+        self._batch_plot.clear()
+        bg = self._pg.BarGraphItem(
+            x=[xi - bar_width / 2 for xi in x],
+            height=before_vals[:n],
+            width=bar_width,
+            brush="#607D8B",
+            name="Before",
+        )
+        ba = self._pg.BarGraphItem(
+            x=[xi + bar_width / 2 for xi in x],
+            height=after_vals[:n],
+            width=bar_width,
+            brush="#4CAF50",
+            name="After",
+        )
+        self._batch_plot.addItem(bg)
+        self._batch_plot.addItem(ba)
+        self._batch_plot.setLabel("bottom", "File index")
+        self._batch_plot.setLabel("left", self._metric_combo_batch.currentText())
+
+    def _draw_hist(self) -> None:
+        if not self._pg or self._hist_plot is None:
+            return
+        key = self._metric_combo_hist.currentData()
+        if not key:
+            return
+        rows = self._load_history()
+        before_key = f"{key}_b"
+        after_key = f"{key}_a"
+        before_vals = [r.get(before_key) for r in rows]
+        after_vals = [r.get(after_key) for r in rows]
+        xs = list(range(len(rows)))
+        self._hist_plot.clear()
+        b_clean = [(i, v) for i, v in zip(xs, before_vals) if v is not None]
+        a_clean = [(i, v) for i, v in zip(xs, after_vals) if v is not None]
+        if b_clean:
+            bx, by = zip(*b_clean)
+            self._hist_plot.plot(list(bx), list(by), pen="#607D8B", name="Before")
+        if a_clean:
+            ax, ay = zip(*a_clean)
+            self._hist_plot.plot(list(ax), list(ay), pen="#4CAF50", name="After")
+        self._hist_plot.setLabel("bottom", "Run index")
+        self._hist_plot.setLabel("left", self._metric_combo_hist.currentText())
+        legend = self._hist_plot.addLegend()
+        legend.setOffset((10, 10))
+
+
 class _NullCtx:
     def __enter__(self):
         return self
