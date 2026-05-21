@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r116"
+_DSRE_VERSION = "r117"
 
 
 # ===== DSP パラメータ =====

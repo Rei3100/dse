@@ -1,425 +1,504 @@
-# DSRE Sub-project B+D: ワークフロー自動化 + 客観品質ゲート 設計書
+# DSRE Sub-project B+D: ワークフロー自動化 + 客観品質ゲート 設計書 (v3)
 
-**Date:** 2026-05-21
-**Scope:** 同曲グルーピング / 客観品質スコアリング / 自動最良選択 / opus 出力 / foobar 階層仕分け
-**Integrated:** B (ワークフロー) と D (品質ゲート) を統合。品質判定は「自動選別の入力データ」として B に組み込まれる
-**Premise:** 全自動運用がデフォルト。要注意フラグ時のみユーザー確認
-
----
-
-## 0. 目的 (ワンライン)
-
-INPUT_DIR の楽曲群を解析・グルーピングし、同曲の複数バージョンから客観品質最良の 1 つを選択 → DSRE 処理 → opus 出力 → foobar 階層へ自動仕分け。残りは送信トラッシュへ。
+**Date:** 2026-05-21 (v3 全面再点検)
+**Scope:** 重複検出 / 客観品質スコアリング (opus 採点) / 最良選択 / pre 処理仕分け+リネーム / post 処理仕分け+リネーム / 識別可能な破棄 / 同曲別バージョン間メタデータ整合 / 冪等性 / 失敗リジューム
+**Integrated:** B (ワークフロー) と D (客観品質ゲート) を統合
+**Out of scope:** メタデータ自動取得 (Sub-project C・将来別ツール)、foobar での opus 変換 (DSRE の役割ではない)
 
 ---
 
-## 1. 全体パイプライン (DAG)
+## 0. 出力フォーマット
+
+| 種類 | 形式 | 役割 |
+|---|---|---|
+| **最終出力** | **FLAC 96kHz PCM_24** | DSRE 処理結果。既存通り。これが残る。 |
+| **opus** | **採点用テンポラリ** | 同条件比較のためだけに生成、解析後即削除 |
+
+opus は DSRE の最終出力ではない。foobar での opus 変換は **ユーザーが従来通り別途行う**。
+
+---
+
+## 1. ユーザーの既存ワークフロー (前提)
 
 ```
-[INPUT_DIR scan]
-       │
-       ▼
-[metadata extract] (mutagen)
-       │
-       ▼
-[grouping] (artist + title + album → group id)
-       │
-       ▼
-[quality analysis] (MetricsComputer per file)
-       │
-       ▼
-[score + flag] (QualityScorer)
-       │
-       ▼
-[best selection] (group 内 max score, フラグ判定)
-       │
-       ▼ (best のみ)
-[DSRE processing] (zansei_impl, 既存)
-       │
-       ▼
-[opus encode] (ffmpeg libopus 256k VBR)
-       │
-       ▼
-[foobar path build] (template + sanitize)
-       │
-       ▼
-[final placement] (OUTPUT_DIR/{path}.opus)
-       │
-       ▼
-[trash discarded versions + intermediate FLAC]
+音源 (raw FLAC、同曲複数バージョンあり)
+   ↓ mp3tag でメタデータ取得 (手動、将来 Sub-project C で自動化候補)
+   ↓ DSRE 用フォルダに処理前として出力 ← Sub-project B+D が自動化
+   ↓ DSRE 処理
+   ↓ アートワーク埋め込み (Sub-project A で対応済)
+   ↓ foobar 互換階層に仕分け+リネーム ← Sub-project B+D が自動化
+   ↓ foobar で opus 変換 (DSRE 外、ユーザーが従来通り)
+```
+
+思想 (原指示): **出来るだけ楽に・可能な部分は全部自動化・手動確認とかかかる時間を極限まで減らす**。
+
+---
+
+## 2. 全体パイプライン
+
+```
+[STAGE 1: 処理前段階]
+  INPUT_DIR スキャン (.flac、再帰)
+    ↓ 既処理 (dsre_version タグあり) は冪等 skip
+  各ファイルのメタデータ抽出 (mutagen)
+    ↓
+  同曲グルーピング (5-key match + 別バージョンタグ差分検出)
+    ↓
+  別バージョン間のメタデータ整合 (共通フィールドを最良候補値で統一)
+    ↓
+  グループ内の各ファイルを採点 (opus 182k VBR エンコード → デコード → 解析、並列)
+    ↓
+  グループ内で最良 1 つを選択 (要注意フラグ判定込み)
+    ↓
+  非最良は識別可能リネーム + send2trash
+    ↓
+  最良 1 つを foobar 互換階層で INPUT_DIR 内に再配置 (rename + sort)
+
+[STAGE 2: DSRE 処理]
+  最良ファイル群を順次 DSRE 処理 (zansei_impl、既存)
+    ↓ アートワーク埋め込み (Sub-A、既存)
+  96kHz FLAC PCM_24 出力
+
+[STAGE 3: 処理後段階]
+  出力 FLAC を foobar 互換階層で OUTPUT_DIR 内に配置 (同テンプレート)
+  → INPUT_DIR と OUTPUT_DIR は 1:1 同型のレイアウトになる
 ```
 
 ---
 
-## 2. 同曲グルーピング (重複検出)
+## 3. 同曲グルーピング
 
-### 2.1 判定ロジック (段階的)
+### 3.1 マッチキー (5-key)
 
-**段階 1: メタデータ完全一致**
 ```python
 key = (
-    normalize(artist),
-    normalize(title_strip_version_suffix),
-    normalize(album),
+    norm(artist),
+    norm(album),
+    discnumber or "1",
+    tracknumber.zfill(3),
+    norm(title),
 )
 ```
-`normalize`: lowercase + 全角半角統一 + 連続空白 → 単一 + 前後 trim。
 
-**段階 2: タイトル一致 + duration 近似**
-段階 1 でグループ化されなかったファイルを duration ±2 秒以内かつ title 近似一致でマージ。
+`norm`: lowercase + 全角半角統一 + 連続空白 → 単一 + 前後 trim。
 
-**段階 3: ファイル名 fuzzy match (fallback)**
-メタデータ欠落時の安全網。`rapidfuzz.fuzz.token_set_ratio > 90`。
+完全一致した複数ファイルが「同曲候補」になる。
 
-### 2.2 別曲扱い suffix (グルーピング対象外)
+注: `albumartist` は使わない (ユーザーの実環境タグに存在しない)。`artist` のみ。
 
-title 末尾の以下パターンは「別バージョン = 別曲」として保持:
-- `[Live]`, `[Acoustic]`, `[Remix]`, `[Instrumental]`, `[Off Vocal]`, `[Karaoke]`, `[TV Size]`
-- `(Live)`, `(Acoustic)`, `(Remix)`, `(Instrumental)`, `(Off Vocal)`
-- `-Live-`, `-Remix-`, `-Acoustic-`
+### 3.2 別バージョン判定 (バージョン系タグ差分)
 
-サフィックス検出は `_VERSION_TAG_PATTERNS` 定数で正規表現管理。新パターン追加時はここを更新。
+同 key の候補グループ内で以下のタグのいずれかが異なれば **別バージョン** として独立保持:
 
-### 2.3 単独ファイル (グループサイズ 1)
+| タグ名 | 用途 |
+|---|---|
+| `version_info` | バージョン汎用 |
+| `cover_type` | カバー種別 |
+| `live_type` | ライブ種別 |
+| `vocal_type` | ボーカル種別 |
+| `remaster_info` | リマスター情報 |
+| `arrange_type` | アレンジ種別 |
+| `m_number` | M ナンバー |
 
-そのまま処理対象。比較なしで DSRE → opus → 仕分けへ進む。
+(ユーザー原テンプレートで `[..]` suffix として展開される 7 タグ。タグの有無・値の差分で別版判定。)
+
+これら全部同一 (または全部空) → 真の重複として 1 つに絞る。
+いずれか異なる → 別バージョン、別 group として両方残す。
+
+正規表現で `[Live]` 等のタイトル末尾を検出する手法は採らない (発明禁止)。
+
+### 3.3 同曲別バージョン間のメタデータ整合
+
+ユーザー思想 「全部同じメタデータじゃないとなのよ」 (同曲は共通メタデータ揃え) に従い、別バージョンとして保持する複数 file に対し:
+
+- **共通フィールド** (artist, album, discnumber, tracknumber, title, date, genre, age, circle, category, source, grouping, franchises, products, series, brand, subtitle, elements, project, collaboration, group, unit, album_type): グループ内で値が異なるなら **最良候補の値に統一** (mutagen で書き換え)
+- **バージョン系フィールド** (§3.2 の 7 タグ): 触らない (それぞれの版独自)
+- **featuring/produced**: グループ内全 file で同一なら統一、異なれば触らない (版ごとに異なる場合あり)
+
+これにより、別版 file 群は「version 系タグ以外は完全同一」状態になり、後のリネーム・仕分け先パスが「version suffix だけ違って同一階層」に揃う。
+
+### 3.4 メタデータ欠落
+
+artist / album / title 等の主要タグ欠落:
+- 同 key 計算不可 → 単独 group 扱い (グルーピング対象外)
+- 警告ログ
+- DSRE 処理は通常通り進める (foobar 仕分けは可能な範囲で適用、欠落レベルは省略)
 
 ---
 
-## 3. 客観品質スコアリング (B+D の核)
+## 4. 客観品質スコアリング (B+D の核)
 
-### 3.1 入力ファイルの解析
+### 4.1 採点用 opus エンコード
 
-各 FLAC を読み込み、既存 `MetricsComputer.compute()` で 15 メトリクスを取得。重い処理 (1 ファイル数秒) なのでバッチで pre-cache する。
+音量正規化は **DSRE 既存の `save_flac24_out` 内の volume normalization をそのまま流用** (true peak 8x oversampling → -0.3 dBFS target、clip=0 を構造的保証する既存ロジック)。新規に ReplayGain 相当を実装しない。
 
-### 3.2 スコア式
+```python
+# Step 1: 既存 DSRE 音量正規化を流用 (save_flac24_out 内の関数を抽出)
+audio_norm = dsre_normalize_volume_for_clip_zero(audio, sr)
 
-0-100 のスケールに正規化。
+# Step 2: tmp FLAC 経由で ffmpeg libopus 182k VBR (ユーザー既存設定と同)
+ffmpeg -i {tmp_norm.flac} \
+  -c:a libopus -b:a 182k -vbr on -application audio \
+  {tmp.opus} -y
+
+# Step 3: opus デコード → MetricsComputer.compute()
+# Step 4: スコア計算
+# Step 5: tmp opus / tmp norm flac を try/finally で必ず削除
+```
+
+DSRE と同じ正規化を使う = 「DSRE 処理後 opus 変換した時の最終形」を限りなく忠実にシミュレート。フェア比較の本質を満たす。
+
+### 4.2 並列化
+
+opus エンコードは subprocess、CPU 並列可能。`ThreadPoolExecutor(max_workers=os.cpu_count())` で並列化。50 ファイルで 4-8 分 → 1-2 分。
+
+中断対応: 各 future の tmp は try/finally で削除、cancel 時も漏れなし。
+
+### 4.3 スコア式 (初期値、調整可能)
+
+opus デコード後の解析値を以下で合算 (0-100):
 
 ```python
 score = 0.0
-
-# Dynamic Range (高いほど良好。max 60 点)
-score += clamp(dr, 0, 20) * 3.0
-
-# LUFS proximity to -14 (配信標準。max 20 点)
-score += clamp(20 - abs(lufs + 14), 0, 20)
-
-# 高域存在 (max 10 点)
-score += clamp(hf_ratio_12k, 0, 0.05) * 200
-
-# スペクトル平坦性 (高いほど自然。max 10 点)
-score += clamp(flatness, 0, 0.5) * 20
-
-# --- 減点 ---
-score -= min(clip_count * 0.05, 20)           # クリップ過多 (max -20)
-score -= max(0, peak_db + 0.1) * 5             # 0dBFS 張り付き (max -10)
-score -= max(0, 6 - plr) * 2                   # PLR < 6 (ハイパー圧縮、max -12)
-
+score += clamp(dr, 0, 20) * 3.0           # DR (max 60)
+score += clamp(20 - abs(lufs + 14), 0, 20) # LUFS proximity (max 20)
+score += clamp(hf_ratio_12k, 0, 0.05) * 200 # HF (max 10)
+score += clamp(flatness, 0, 0.5) * 20      # spectral flatness (max 10)
+score -= max(0, 6 - plr) * 2                # PLR < 6 ペナルティ (max -12)
 score = clamp(score, 0, 100)
 ```
 
-期待値帯:
-- 80-100: 高音質マスター (Hi-Res / 良好マスタリング)
-- 60-80: 標準 CD 品質 (現代的マスタリング)
-- 40-60: 過剰圧縮気味の現代 J-pop マスター
-- 20-40: brick wall master, クリップ多発
-- 0-20: 致命的劣化
+clip_count / peak_db は normalize で揃うため減点対象外。
+重み・閾値は env var で上書き可能 (§16)。実運用で観測しながら調整。
 
-### 3.3 要注意フラグ (主観品質ゲート D の自動化)
+### 4.4 要注意フラグ (D: 数値良好でも実聴劣化を捕まえる)
 
-以下のいずれかに該当する場合「⚠ 要確認」フラグを立てる:
+過去問題: 「数値は良いのに聴いたら明らかに劣化」のパターン検出フラグ:
 
-| フラグ条件 | 意味 |
+| フラグ条件 | 検出意図 |
 |---|---|
-| `clip_count > 100` | 大量クリップ。波形破壊の可能性 |
-| `flatness < 0.05` | スペクトル平坦性極小 = brick wall |
-| `hf_ratio_16k < 0.0005` | 高域カットされている (lossy 由来の可能性) |
-| `plr < 4.0` | peak-to-loudness 危険水準 (ハイパー圧縮) |
-| `dr < 6` | DR 危険水準 (聴感劣化リスク) |
+| `hf_ratio_16k < 0.0005` かつ `rolloff_hz < 17000` | 高域カット (lossy origin の可能性) |
+| `flatness < 0.05` | スペクトル平坦性極小 (brick wall master) |
+| `dr < 6` | DR 危険水準 (ハイパー圧縮原音) |
+| `harmonic_1k_proxy > 0.5` かつ `dr > 12` | 高 DR だが歪み多 (アーティファクト疑い) |
+| `hf_ratio_8k > 0.3` かつ `centroid_hz > 6000` | 不自然な高域偏重 (人工的アップサンプル疑い) |
 
-### 3.4 自動選択ロジック
+フラグは ログ + UI の summary に表示。デフォルトは **確認なしで自動進行** (§5)。
+
+### 4.5 自動選択ロジック
 
 ```python
-def select_best(group: list[FileMetric]) -> Selection:
+def select_best(group: list[FileScore]) -> Selection:
     no_flag = [f for f in group if not f.flagged]
-    if no_flag:
-        # フラグなしの中から最高スコア
-        best = max(no_flag, key=lambda f: f.score)
-        return Selection(best, reason="clean_max_score")
-    else:
-        # 全てフラグあり → 最高スコア (要確認のまま)
-        best = max(group, key=lambda f: f.score)
-        return Selection(best, reason="flagged_max_score", warn=True)
+    pool = no_flag if no_flag else group
+    best = max(pool, key=lambda f: (f.score, f.file_size))
+    return Selection(best, all_flagged=(not no_flag))
 ```
 
-同点の場合: ファイルサイズ大 (高ビットレート/解像度) を優先。
+同点: ファイルサイズ大 (情報量多) を優先。
 
 ---
 
-## 4. メタデータ取得
+## 5. ユーザー介入の最小化 (思想実装)
 
-### 4.1 抽出フィールド (mutagen)
+「手動確認とかかかる時間を極限まで減らす」に従い:
 
-| フィールド | Vorbis Comment タグ | 必須/任意 | 不足時 fallback |
-|---|---|---|---|
-| artist | `artist` | 必須 | albumartist → "Unknown Artist" |
-| albumartist | `albumartist` | 任意 | artist で代替 |
-| title | `title` | 必須 | ファイル名から推定 |
-| album | `album` | 任意 | "Unknown Album" |
-| date | `date` | 任意 | "" |
-| genre | `genre` | 任意 | "Unknown" |
-| discnumber | `discnumber` | 任意 | "1" |
-| tracknumber | `tracknumber` | 任意 | "00" |
-| circle | `circle` | 任意 | "" (同人系) |
-| brand | `brand` | 任意 | "" (ゲーム系) |
-| series | `series` | 任意 | "" |
+- **デフォルト**: 全 group 自動進行 (フラグ付きグループも警告ログ出すだけで処理続行)
+- **env `DSRE_INTERACTIVE_CONFIRM=1`** で初めて UI ダイアログを有効化 (opt-in)
+- ユーザーは事後に `OUTPUT_DIR/_workflow_log.txt` を見て判断 → 必要に応じてゴミ箱から復元
 
-### 4.2 ファイル名フォールバックパース
-
-`{tracknum}. {title}` または `{tracknum} {title}` を正規表現で抽出。
-パース不可なら `os.path.splitext(basename)[0]` を title に代入。
-
----
-
-## 5. opus エンコード
-
-### 5.1 コマンド
-
-```bash
-ffmpeg -i {input.flac} \
-  -c:a libopus -b:a 256k -vbr on -compression_level 10 -application audio \
-  -map_metadata 0 \
-  {output.opus}
-```
-
-- bitrate 256k VBR: 透明圧縮目安 (48kHz サンプル, ステレオ)
-- compression_level 10: 最高品質 (CPU 時間長いがバッチ運用なので許容)
-- application audio: 音楽特化モード
-
-### 5.2 アートワーク移植
-
-ffmpeg の `-map_metadata` では PICTURE が opus に移らないため、mutagen で別途処理:
-
-```python
-# 入力 FLAC から抽出
-pictures = _extract_flac_pictures(input_flac)
-# opus 出力に書き込み (mutagen.oggopus.OggOpus)
-opus = OggOpus(output_opus)
-for pic in pictures:
-    opus["metadata_block_picture"] = [base64_encode_picture(pic)]
-opus.save()
-```
-
-opus の PICTURE は base64 化された PICTURE ブロックを `metadata_block_picture` Vorbis Comment に入れる仕様。
-
-### 5.3 DSRE 識別タグ
-
-opus 出力にも `dsre_version` / `dsre_processed_utc` を埋め込む。`_embed_output_metadata_opus(path)` ヘルパーを追加。
+これにより、処理を投げた後の手動介入が原則ゼロになる。
 
 ---
 
 ## 6. foobar 互換フォルダ階層
 
-### 6.1 デフォルトテンプレート
+### 6.1 ユーザー原テンプレート (再掲)
 
+ユーザー指示のフルテンプレ:
 ```
-{OUTPUT_DIR}\Audio\{category}\{artist_or_circle}\{album}\{disc_track}.{title}.opus
+Audio / [{device}] / [{genre}] / [{age}] / [{circle}] / [{category}] /
+[{source}] / [{grouping}] /
+[{franchises if franchises != project}] /
+[{products if products != project and != brand}] /
+[{series if series != project}] /
+[{brand}] /
+[{subtitle if subtitle != brand and != franchises}] /
+[{elements if elements != brand and != franchises and != subtitle}] /
+[{project}] / [{collaboration}] / [{group}] / [{unit}] / [{album_type}] /
+[{year}/{month}/] /
+{album} [(date)] /
+Disc {discnumber:02d} /
+{discnumber:02d}.{tracknumber:03d}.{title}
+  [- {artist}|- {artist} [feat. {featuring}]]
+  [[Prod. {produced}]]
+  [[{arrange_type}]]
+  [[{version_info}]]
+  [[{remaster_info}]]
+  [[{cover_type}]]
+  [[{live_type}]]
+  [[{vocal_type}]]
+  [[{m_number}]]
+.flac
 ```
 
-- `category`: genre タグから category mapping table 経由
-- `artist_or_circle`: circle タグがあれば circle、なければ albumartist (なければ artist)
-- `disc_track`: disc=1 のみなら `{tracknum:02d}`、複数 disc なら `{disc}-{tracknum:02d}`
+各レベル/サフィックスは **タグ存在で挿入、欠落で省略**。
 
-### 6.2 category mapping table
+### 6.2 DSRE での適用 (OUTPUT_DIR ＝ `C:\Audio\DSRE\Output\`)
 
-```python
-GENRE_CATEGORY = {
-    "j-pop": "J-Pop",
-    "anime": "Anison",
-    "anison": "Anison",
-    "game": "VGM",
-    "vgm": "VGM",
-    "classical": "Classical",
-    "doujin": "Doujin",
-    "touhou": "Doujin",
-    "vocaloid": "Vocaloid",
-    # ... fallback
-    "_default": "Other",
-}
+DSRE 側は `Audio/[{device}]/` を **使わない** (OUTPUT_DIR の `Audio` と重複)。
+DSRE テンプレート:
+```
+{OUTPUT_DIR}/
+  [{genre}/] [{age}/] [{circle}/] [{category}/] [{source}/] [{grouping}/]
+  [{franchises}/] [{products}/] [{series}/] [{brand}/]
+  [{subtitle}/] [{elements}/] [{project}/] [{collaboration}/]
+  [{group}/] [{unit}/] [{album_type}/]
+  [{year}/{month}/]
+  {album}[' ('date')'] /
+  [Disc {disc:02d}/]      ← 単 disc アルバムは省略
+  {disc:02d}.{track:03d}.{title}
+    [- {artist}[' [feat. 'featuring']']]
+    [' [Prod. 'produced']']
+    [' ['arrange_type']']
+    [' ['version_info']']
+    [' ['remaster_info']']
+    [' ['cover_type']']
+    [' ['live_type']']
+    [' ['vocal_type']']
+    [' ['m_number']']
+  .flac
 ```
 
-genre が table にない場合は "Other" へ。table は外部 JSON (`genre_category.json`) に切り出し、ユーザー編集可能とする。
+実装は `FoobarPathBuilder` クラス (純関数集合) に閉じ込め。
 
-### 6.3 Windows ファイル名サニタイズ
+### 6.3 複数値タグの delimiter 処理
 
-禁止文字 `< > : " / \ | ? *` を全角に置換:
-- `<` → `＜`, `>` → `＞`, `:` → `：`, `"` → `”`, `/` → `／`, `\` → `＼`, `|` → `｜`, `?` → `？`, `*` → `＊`
-
-末尾の `.` や空白も削除 (Windows 仕様)。
+foobar 原テンプレートで `/` を空白等に置換しているのに従う:
+- artist の `/` → `_ ` (アンダースコア + 空白)
+- featuring の `/` → `* ` (アスタリスク + 空白)
+- arrange_type, version_info, remaster_info の `;` → ` /` (空白スラッシュ)
 
 ### 6.4 衝突回避
 
-同パスが既に存在する場合:
-- ハッシュ比較し同一なら skip
-- 異なる内容なら suffix `_2.opus`, `_3.opus`, ...
+同パス既存:
+- 内容ハッシュ一致 → skip + ログ
+- 内容相違 → 数字 suffix `_2.flac`, `_3.flac`, ...
+
+### 6.5 Windows パス制約
+
+- 禁止文字 `< > : " / \ | ? *` を全角に置換
+- 末尾の `.` や空白を削除
+- パス長が 250 chars 超過時: `\\?\` プレフィックス使用 (Windows API で MAX_PATH 回避)
+- 250 chars 超過は警告ログ (将来テンプレ縮約検討)
+
+### 6.6 単 disc アルバムの Disc 階層省略
+
+album 内の全 track の discnumber が "1" のみ → `Disc 01/` 階層を省略。
+複数 disc の album → 全 track に `Disc NN/` 階層を作成 (混在防止)。
 
 ---
 
-## 7. 処理順序
+## 7. 処理前 (STAGE 1) の仕分け+リネーム
 
-グループ単位での走査順:
-```
-ORDER BY albumartist, album, discnumber, tracknumber
-```
+最良ファイル選択後、それを **§6.2 の foobar テンプレートで INPUT_DIR 内に再配置** (rename + sort)。
 
-同アルバムを連続処理することで:
-- I/O ローカリティ向上
-- 進捗表示の自然さ (album 単位で完了)
-- アートワーク Picture の重複読込最小化 (将来キャッシュ可能)
+これにより:
+- ユーザーが INPUT_DIR を覗いた瞬間、処理予定 file 群が整理された階層で見える
+- STAGE 3 後の OUTPUT_DIR と完全同型 (1:1 対応)
+- DSRE 処理は再配置後のパスから入力
+
+非最良 (重複) は §8 へ。
 
 ---
 
-## 8. UI 変更 (MainWindow)
+## 8. 破棄処理 (識別可能リネーム → ゴミ箱)
 
-「常に全自動」のため、UI は最小限。
+### 8.1 リネーム規則
 
-### 8.1 既存 UI 維持
-
-- ラベル (進捗テキスト)
-- pb_file (現ファイル進捗)
-- pb_all (全体進捗)
-- btn_start (開始)
-- 負荷スライダー
-
-### 8.2 進捗テキスト形式
-
+非最良ファイルを send2trash する前に:
 ```
-解析中 (12/45)
-グルーピング: 28 group, 17 重複
-処理中 [3/28] album_name / track_03.flac
-opus 変換中 ...
-仕分け中 → Audio/J-Pop/...
-完了 22/28 (4 skip, 2 ⚠要確認)
+{元のファイル名}.__discarded_dsre_inferior__.flac
 ```
 
-### 8.3 要確認ダイアログ (フラグ時のみ)
+例: `track01_v2.flac` → `track01_v2.__discarded_dsre_inferior__.flac` → trash 行き。
+ユーザーがゴミ箱を覗くと「DSRE が劣品質と判定して捨てた」と一目で識別可能。
 
-全候補にフラグ ON のグループに当たった時、モーダルで:
-- グループ内全ファイルのスコア・フラグ一覧表
-- 「最高スコアで進める」/「このグループをスキップ」/「全 ⚠ を一律進める」(以降同セッション無確認)
+### 8.2 破棄ログ
 
-「全 ⚠ を一律進める」は session 終了で reset。
-
-### 8.4 ログ出力
-
-詳細ログを `OUTPUT_DIR/_workflow_log.txt` に追記:
+`OUTPUT_DIR/_workflow_log.txt` に追記:
 ```
-[2026-05-21T18:00:00] group=Author-Title-Album files=3 selected=track01_v3.flac score=78 reason=clean_max_score
-[2026-05-21T18:00:42] -> Audio/J-Pop/Artist/Album/01.Title.opus
-[2026-05-21T18:00:42] trash: track01_v1.flac (score=45 flagged: brick_wall)
-[2026-05-21T18:00:42] trash: track01_v2.flac (score=62 ok)
+[2026-05-21T18:00:00] group=Artist-Album-Disc01-Track03
+  kept    : v3.flac     score=78 (clean)
+  discard : v1.flac     score=45 flags=brick_wall
+  discard : v2.flac     score=62 (clean) — lower score
 ```
 
 ---
 
-## 9. 新規クラス・モジュール
+## 9. 処理後 (STAGE 3) の仕分け+リネーム
+
+DSRE 処理結果の FLAC を **§6.2 の同テンプレートで** OUTPUT_DIR 内に配置。
+
+INPUT_DIR レイアウト ↔ OUTPUT_DIR レイアウトが 1:1 同型になる。foobar から OUTPUT_DIR を読めば既存設定のまま opus 変換可能。
+
+---
+
+## 10. 冪等性 (再実行安全性)
+
+スキャン時に各 file の `dsre_version` Vorbis Comment タグを確認:
+- タグ存在 → 既処理、skip (再 DSRE しない、再仕分けもしない)
+- タグ未在 → 通常処理
+
+これによりユーザーが何度 「開始」 ボタンを押しても破壊的変更は発生しない。
+
+---
+
+## 11. 失敗時のリジューム
+
+journal は持たない。状態は INPUT_DIR / OUTPUT_DIR のファイル配置とタグで自己記述する:
+
+- STAGE 1 中で停止: 仕分け済の最良ファイルは INPUT_DIR の階層位置で識別可能、未処理は残置。再実行時、`dsre_version` 無しの file を再スキャン。
+- STAGE 2 中で停止: 最良ファイル群は INPUT_DIR にあり、一部が処理済。再実行で未処理分のみ DSRE 処理。
+- STAGE 3 中で停止: DSRE 完了 file は OUTPUT_DIR にあり、仕分け前のものは OUTPUT_DIR ルートに残る。再実行で残置分を仕分けする (= STAGE 3 のみリトライ可能)。
+
+冪等性 (§10) と組み合わせて、何度落ちても再走で続きから自動的に進む。
+
+---
+
+## 12. 処理順序 (バッチ順)
+
+採点・処理ともに以下の順:
+```
+ORDER BY artist, album, discnumber, tracknumber
+```
+
+I/O ローカリティ・進捗の自然さ。
+
+---
+
+## 13. UI 変更 (MainWindow、既存維持 + 進捗テキスト改善)
+
+「常に全自動」なので UI は最小限維持。
+
+進捗テキスト形式:
+```
+[STAGE 1] スキャン 45 files (3 既処理 skip)
+[STAGE 1] グルーピング 28 group (8 重複)
+[STAGE 1] 採点 並列 12/45 (45 sec ETA)
+[STAGE 1] 最良選択 完了、破棄 17
+[STAGE 1] 整列 INPUT_DIR
+[STAGE 2] DSRE 処理 [3/28] {album}/{track}
+[STAGE 3] 整列 OUTPUT_DIR
+完了 28/28 (要確認 2 → _workflow_log.txt 参照)
+```
+
+トレイメニュー: 既存維持 (Sub-A で簡素化済の「開始」のみ)。
+
+要確認ダイアログは **デフォルト OFF** (§5)。`DSRE_INTERACTIVE_CONFIRM=1` で opt-in。
+
+---
+
+## 14. 新規モジュール
 
 | クラス | 責務 | 既存依存 |
 |---|---|---|
-| `WorkflowScanner` | INPUT_DIR 走査・メタデータ抽出 | mutagen |
-| `TrackGrouper` | 同曲グルーピング (3 段階判定) | rapidfuzz |
-| `QualityScorer` | スコア式 + フラグ判定 | 既存 MetricsComputer |
-| `BestSelector` | グループ内最良選択 | QualityScorer |
-| `OpusEncoder` | DSRE 後 FLAC → opus 変換 + アートワーク移植 | ffmpeg, mutagen |
-| `FoobarSorter` | メタデータ → foobar 階層パス生成 | (純関数) |
-| `WorkflowOrchestrator` | 全体 DAG 統括 | 全部 |
+| `MetadataExtractor` | mutagen で原テンプレ参照タグ群を抽出 | mutagen |
+| `TrackGrouper` | 5-key match + version タグ差分 | (純関数) |
+| `MetadataHarmonizer` | グループ内共通フィールドを最良値に統一 | mutagen |
+| `QualityProbe` | DSRE 流用 normalize + opus encode + decode + 解析 | ffmpeg, MetricsComputer, DSRE 既存 |
+| `BestSelector` | グループ内最良選択 (フラグ判定込み) | (純関数) |
+| `DiscardHandler` | 識別可能リネーム + send2trash | send2trash |
+| `FoobarPathBuilder` | テンプレ展開 (optional level / suffix、サニタイズ、長パス対応) | (純関数) |
+| `WorkflowOrchestrator` | STAGE 1-3 統括、冪等性 + リジューム制御 | 全部 |
 
-`WorkflowOrchestrator` が `Worker.run` の置換対象。既存 `_process_one` は最良ファイル単体処理関数として温存し、Orchestrator から呼ぶ。
+既存 `Worker._process_one` (DSRE 本体処理) は STAGE 2 から呼ばれる関数として温存。`WorkflowOrchestrator` が `Worker.run` ループを置き換える。
 
----
-
-## 10. 依存追加
-
-```
-rapidfuzz>=3.6.0      # ファイル名 fuzzy match (グルーピング段階 3)
-```
-
-opus 変換は同梱 ffmpeg を流用。新規バイナリ依存なし。
-
-DSRE.spec の hidden imports / datas に `rapidfuzz` 追加。
+DSRE 既存 `save_flac24_out` 内の volume normalization 部分を独立関数として抽出して採点用にも流用可能にする (リファクタ、機能変更なし)。
 
 ---
 
-## 11. 変更ファイル
+## 15. 依存追加
+
+opus エンコードは同梱 ffmpeg + libopus。新規バイナリ依存なし。
+Python 側も追加なし (mutagen は Sub-A で導入済)。
+
+---
+
+## 16. 変更ファイル
 
 | ファイル | 変更種別 | 概要 |
 |---|---|---|
-| `DSRE.py` | 大幅追加 | 7 新クラス、Worker 置換、Orchestrator 統括 |
-| `requirements.txt` | 修正 | `rapidfuzz` 追加 |
-| `DSRE.spec` | 修正 | `rapidfuzz` hidden imports / collect_all 追加 |
-| `genre_category.json` | 新規 | ジャンル → category マッピング (ユーザー編集可) |
-| `version_tags.json` | 新規 | サフィックス検出パターン (将来拡張用) |
+| `DSRE.py` | 大幅追加 + 軽微リファクタ | 8 新クラス、Worker 改修、Orchestrator 統括、`save_flac24_out` 内の volume norm 関数を抽出 |
+| `requirements.txt` | 変更なし | - |
+| `DSRE.spec` | 変更なし | - |
 
 ---
 
-## 12. テスト計画
+## 17. テスト計画
 
 | 検証項目 | 方法 | 合格基準 |
 |---|---|---|
-| グルーピング 完全一致 | mock metadata 3 同曲 | 1 group |
-| グルーピング 別バージョン | "[Live]" 含む 2 件 | 2 group |
-| グルーピング 部分一致 | duration ±1 秒の同曲 | 1 group |
-| スコア式 高品質 | DR=15 LUFS=-14 → score 計算 | score > 80 |
-| スコア式 過剰圧縮 | DR=4 plr=3 → score 計算 | score < 30 |
-| フラグ brick wall | flatness=0.03 | flagged=True |
-| 最良選択 全 clean | clean 3 件 | max score 選択 |
-| 最良選択 全 flagged | flagged 3 件 | max + warn=True |
-| opus 変換 | 96kHz FLAC → opus | 256k VBR, 復号可 |
-| アートワーク移植 | JXL 入り FLAC → opus | PICTURE 保持 |
-| foobar パス生成 | full metadata | template 通り |
-| foobar パス サニタイズ | `?` 入り title | 全角化 |
-| 衝突回避 | 同パス既存 | `_2.opus` 等 |
+| グルーピング 5-key | mock 3 同曲 | 1 group |
+| グルーピング 別バージョンタグ差分 | `version_info` 違い | 別 group |
+| グルーピング メタ欠落 | title 欠落 | 単独 group |
+| メタデータ整合 | グループ内 genre 不一致 | 最良値で統一 |
+| 採点 normalize | DSRE 同等 norm | clip=0 達成 |
+| 採点 opus エンコード+削除 | 通常 + 中断 | tmp 漏れなし |
+| 採点 スコア | 高品質 mock | score > 80 |
+| フラグ HF cliff | rolloff=15k hf_16k=0 | flagged |
+| 最良選択 全 clean | 3 件 | max score |
+| 最良選択 全 flagged | 3 件 | max + all_flagged=True |
+| 破棄リネーム | non-best | `__discarded_dsre_inferior__` suffix |
+| ゴミ箱投入 | discard | send2trash 成功 |
+| FoobarPath all tags | full metadata | テンプレ完全展開 |
+| FoobarPath missing | genre のみ | genre 階層省略 |
+| FoobarPath sanitize | `?` 入り | 全角化 |
+| FoobarPath 長パス | >250 chars | `\\?\` プレフィックス |
+| FoobarPath delimiter | artist に `/` | `_ ` 置換 |
+| 単 disc 省略 | 全 disc=1 | Disc 階層なし |
+| 衝突回避 | 同パス | `_2.flac` |
+| 冪等性 | 既処理 file | skip |
+| リジューム STAGE 2 中断 | mock 中断 + 再実行 | 続き処理 |
+| STAGE 1→2→3 統合 | mock 5 group | 全 STAGE 完了 + 同型レイアウト |
 | selftest | `--selftest` | verdict=EQUIV |
 
 ---
 
-## 13. ロールバック・段階的有効化
-
-環境変数 `DSRE_WORKFLOW=0` で旧パイプライン (sub-project A 状態) に強制 fallback。デフォルトは新パイプライン。
-
-問題発生時は env var 1 行で旧動作復帰、コード変更不要。
-
----
-
-## 14. リスク と 緩和策
-
-| リスク | 緩和 |
-|---|---|
-| 重要バージョンを誤判定で破棄 | send2trash 使用、復元可能 |
-| メタデータ不一致で同曲統合失敗 | 段階 2 / 3 のフォールバック判定 |
-| opus 変換でアートワーク欠落 | mutagen.oggopus で明示移植 |
-| foobar 互換性問題 | category mapping を外部 JSON 化 |
-| 主観劣化を検出できない | 要確認ダイアログ + ログで履歴保持 |
-| 処理時間激増 (解析 + opus 変換) | グループ単位並列化 (将来) |
-
----
-
-## 15. Out of Scope (将来 sub-project)
-
-- **Sub-project C**: メタデータ自動取得 (VGMdb / MusicBrainz)。本設計は「メタデータが既にある」前提
-- **acoustic fingerprint (chromaprint)**: 段階 2/3 で不十分な場合の最終手段
-- **並列化**: グループ単位で thread pool
-- **ユーザー学習**: 「以前 user が選んだバージョン」を覚えて優先
-
----
-
-## 16. 設定可能パラメータ (env var)
+## 18. 設定可能パラメータ (env var)
 
 | env var | デフォルト | 説明 |
 |---|---|---|
-| `DSRE_WORKFLOW` | `1` | 0 で旧パイプライン |
-| `DSRE_OPUS_BITRATE` | `256k` | opus 出力ビットレート |
-| `DSRE_SCORE_LUFS_TARGET` | `-14` | LUFS 目標値 |
-| `DSRE_AUTO_CONFIRM_FLAGGED` | `0` | 1 で全 ⚠ 無確認実行 |
-| `DSRE_KEEP_INTERMEDIATE_FLAC` | `0` | 1 で中間 96kHz FLAC を保持 |
+| `DSRE_WORKFLOW` | `1` | 0 で旧パイプライン (Sub-A 状態) に強制 fallback |
+| `DSRE_PRESORT_INPUT` | `1` | 0 で STAGE 1 の INPUT_DIR 仕分けをスキップ |
+| `DSRE_SCORE_OPUS_BITRATE` | `182k` | 採点用 opus ビットレート (foobar 既存設定と同) |
+| `DSRE_INTERACTIVE_CONFIRM` | `0` | 1 でフラグ群に UI 確認ダイアログ (default OFF = 全自動) |
+| `DSRE_HARMONIZE_METADATA` | `1` | 0 で別バージョン間メタデータ整合を無効化 |
+| `DSRE_DISC_DIR_ALWAYS` | `0` | 1 で単 disc アルバムでも `Disc 01/` 階層を作る |
+| `DSRE_SCORE_WEIGHT_DR` | `3.0` | スコア式 DR 係数 |
+| `DSRE_SCORE_WEIGHT_LUFS_TARGET` | `-14` | LUFS 目標値 |
+
+---
+
+## 19. リスク と 緩和策
+
+| リスク | 緩和 |
+|---|---|
+| 重要バージョン誤判定で破棄 | (1) 識別可能リネーム+ゴミ箱で復元容易 (2) ログ詳細記録 (3) 別バージョンタグ判定で過剰統合防止 |
+| メタデータ整合で意図しないタグ上書き | バージョン系 7 タグは絶対に触らない / featuring は完全同一時のみ統一 |
+| 採点 normalize が DSRE 内部と乖離 | `save_flac24_out` 内の関数を抽出して共有 (重複実装しない) |
+| opus 採点 CPU 重 | 並列化 + tmp file try/finally |
+| パス長超過 | `\\?\` プレフィックス + 警告 |
+| 「数値良好だが実聴劣化」検出漏れ | フラグ 5 種 + 任意の手動再確認ルート (`DSRE_INTERACTIVE_CONFIRM=1`) |
+
+---
+
+## 20. Out of Scope (将来 sub-project)
+
+- **Sub-project C**: メタデータ自動取得 (VGMDB/MusicBrainz/iTunes/AppleMusic API)
+  - VGMDB: artist=CV声優名 → artist タグ off
+  - MusicBrainz: artist=キャラ名 → artist タグ on
+  - 設定の差異が大きく、人間確認ステップは残る見込み
+  - DSRE 本体ではなく別ツールとして検討
+- **foobar での opus 変換**: ユーザーが従来通り別途実施。
+- **acoustic fingerprint (chromaprint)**: メタデータ欠落時の最終手段、現状不要
