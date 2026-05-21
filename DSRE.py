@@ -2052,6 +2052,7 @@ class Worker(QtCore.QThread):
 
             _check_abort()
             y, sr = load_audio_safe(path)
+            pictures = _extract_flac_pictures(path)
             _check_abort()
 
             # 無音トリムは **リサンプル前の元音声** に適用 (アップサンプルは
@@ -2068,6 +2069,8 @@ class Worker(QtCore.QThread):
                 y, sr = _resample_to_target(y, sr, PARAMS.target_sr, par)
             _check_abort()
 
+            before_m = MetricsComputer.compute(y, sr)
+            _check_abort()
             t0 = time.perf_counter()
             y_out = zansei_impl(
                 y, sr,
@@ -2075,6 +2078,7 @@ class Worker(QtCore.QThread):
                 abort_cb=lambda: self._abort,
             )
             proc_time = time.perf_counter() - t0
+            after_m = MetricsComputer.compute(y_out, sr)
             _check_abort()  # zansei が abort_cb 経由で途中終了した可能性あり、ここで弾く
 
             out = os.path.join(OUTPUT_DIR, os.path.basename(path))
@@ -2094,6 +2098,10 @@ class Worker(QtCore.QThread):
                     return "verify_fail"
                 _log_failure(path, "save_fail", e)
                 raise
+            try:
+                _embed_output_metadata(out, pictures, before_m, after_m, lv)
+            except Exception:
+                pass
             _check_abort()
 
             try:
@@ -2103,6 +2111,8 @@ class Worker(QtCore.QThread):
                     output_audio=y_out,
                     sr=sr,
                     processing_time_sec=proc_time,
+                    _before_metrics=before_m,
+                    _after_metrics=after_m,
                 )
             except Exception:
                 # メトリクス記録失敗は本処理を止めない (DB ロック等)
