@@ -671,6 +671,15 @@ class AudioMetricsLogger:
             pass  # ロガー失敗は処理結果に影響させない
 
 
+def _extract_flac_pictures(path: str) -> list:
+    """FLAC ファイルから PICTURE ブロックを mutagen で抽出する。失敗時は空リストを返す。"""
+    try:
+        from mutagen.flac import FLAC
+        return list(FLAC(path).pictures)
+    except Exception:
+        return []
+
+
 # ===== バンドルリソースのパス解決 =====
 def _resource_base_dirs() -> tuple[str, ...]:
     """PyInstaller onedir / 開発実行の両方で同梱リソースを探すためのベースディレクトリ群。"""
