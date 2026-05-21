@@ -25,7 +25,6 @@ for mod in (
     "pyloudnorm",
     "future",
     "mutagen",
-    "pyqtgraph",
 ):
     d, b, h = collect_all(mod)
     datas += d
