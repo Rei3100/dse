@@ -1,7 +1,7 @@
-# DSRE Sub-project B+D: ワークフロー自動化 + 客観品質ゲート 設計書 (v4)
+# DSRE Sub-project B+D: ワークフロー自動化 + 客観品質ゲート 設計書 (v5)
 
-**Date:** 2026-05-21 (v4 構造再設計: acoustic fingerprint を中核に)
-**Core Insight:** メタデータが揃わない現実 (ユーザーは複数版のうち 1 版だけ手動タグ付け) を構造的に解決するため、**chromaprint (acoustic fingerprint) を曲識別の primary key とし、メタデータは fingerprint cluster 内で自動伝播させる**。
+**Date:** 2026-05-21 (v5 抽象化・例の literal 除去・採点シンプル化)
+**Core principle:** 同曲識別は音響指紋で行い、メタデータは指紋クラスタ内で自動伝播する。採点は clip=0 正規化 PCM の直接解析。最小手動介入で raw 投入 → 整列出力。
 
 ---
 
@@ -9,485 +9,389 @@
 
 | 種類 | 形式 | 役割 |
 |---|---|---|
-| **最終出力** | **FLAC 96kHz PCM_24** | DSRE 処理結果。既存通り。これが残る。 |
-| **opus 採点** | **テンポラリ** | 同条件比較のためだけに生成、解析後即削除 |
+| **最終出力** | FLAC 96kHz PCM_24 | DSRE 処理結果 (既存通り) |
 
-opus は DSRE の最終出力ではない。foobar 経由の opus 変換は **ユーザーが従来通り別途**。
+採点用 tmp ファイルは生成しない (§4 参照、opus 採点を廃止)。
 
 ---
 
-## 1. ユーザーの実ワークフロー (前提・原指示準拠)
+## 1. ユーザーワークフロー (前提)
 
 ```
-音源 (raw FLAC、同曲複数版あり)
-   ↓ mp3tag で 1 版のみメタデータ取得 (10 曲 × 3 版 = 30 file のうち 10 file だけタグ済)
-   ↓ DSRE 用フォルダに 30 file 全部投入 ← B+D が以下を全自動化
+raw FLAC 群 (同曲の異なる版が混在)
+   ↓ 一部だけ mp3tag で手動タグ取得 (残りはタグ未整備で可)
+   ↓ DSRE 用フォルダに全部投入                ← B+D が以下を全自動化
    ↓ DSRE 処理
    ↓ アートワーク埋め込み (Sub-A 済)
-   ↓ foobar 互換階層仕分け
-   ↓ foobar で opus 変換 (DSRE 外)
+   ↓ foobar 互換階層への仕分け
+   ↓ foobar 経由で opus 変換 (DSRE 外)
 ```
 
-ユーザー思想 (原指示): **手動確認・かかる時間を極限まで減らす**。
+ユーザー思想: **手動確認と所要時間を極限まで減らす**。タグ未整備の版があっても、整備済の版から自動補完して同じ品質の整列が達成される。
 
 ---
 
 ## 2. 全体パイプライン
 
 ```
-[STAGE 1: 処理前段階]
-  INPUT_DIR 再帰スキャン (.flac)
-    ↓ dsre_version タグ持ち = 既処理、skip (冪等)
-  Acoustic fingerprint 計算 (chromaprint、結果は SQLite キャッシュ)
+[STAGE 1: 処理前]
+  INPUT_DIR 再帰スキャン (既処理 = dsre_version タグ持ち は skip)
     ↓
-  Fingerprint クラスタリング (類似度 > 閾値で union-find)
+  Acoustic fingerprint 取得 (chromaprint、content-hash SQLite cache)
     ↓
-  各 cluster で canonical metadata 源を特定 (タグ充実度最大)
+  指紋クラスタリング (類似度閾値、union-find)
     ↓
-  Cluster 内で canonical → 他 file へメタデータ + アートワーク 伝播
-    (version 系タグ群は伝播対象外、各 file 独自を尊重)
+  各クラスタで canonical 選定 (タグ充実度 + アートワーク有無の加重)
     ↓
-  バージョン分離 (cluster 内で version 系タグ差分のある file は別 sub-cluster に分割、両方残す)
+  canonical → クラスタ内他 file へメタデータ + アートワーク 伝播
+    (version 識別系タグと既値は不変)
     ↓
-  各 sub-cluster で各 file を採点 (opus 182k 並列、DSRE 同等 normalize)
+  版分岐 (version 識別系タグの差分で sub-cluster へ分割、両方残す)
+    ↓
+  各 sub-cluster で各 file を採点 (clip=0 正規化 → 直接解析)
     ↓
   各 sub-cluster で最良 1 つを選択 (要注意フラグ判定込み)
     ↓
   非最良は識別可能リネーム + send2trash
     ↓
-  最良 file 群を foobar 互換階層で INPUT_DIR 内に再配置
+  最良 file 群を foobar 階層で INPUT_DIR 内に再配置
 
 [STAGE 2: DSRE 処理]
-  最良 file 群を順次 DSRE 処理 (zansei_impl、既存)
-    ↓ アートワーク埋め込み (Sub-A、既存)
-  96kHz FLAC PCM_24 出力
+  最良 file 群を順次 DSRE 処理 (zansei_impl、Sub-A 含む既存パス)
 
-[STAGE 3: 処理後段階]
-  出力 FLAC を foobar 互換階層で OUTPUT_DIR 内に配置
-  → INPUT_DIR と OUTPUT_DIR が 1:1 同型レイアウト
+[STAGE 3: 処理後]
+  出力 FLAC を foobar 階層で OUTPUT_DIR 内に配置
+  → INPUT_DIR と OUTPUT_DIR は同型レイアウト
 ```
 
 ---
 
-## 3. 同曲識別 (B+D の構造的核)
+## 3. 同曲識別
 
-### 3.1 Acoustic Fingerprint (chromaprint)
+### 3.1 Acoustic Fingerprint
 
-`fpcalc.exe` (chromaprint 同梱バイナリ、ffmpeg と並列に DSRE バンドル) を subprocess で呼び、各 file の fingerprint を取得:
+chromaprint (`fpcalc.exe`、ffmpeg と並列で DSRE バンドル) を subprocess で呼び、各 file の指紋を取得する。指紋は楽曲の音響的内容に基づく識別子で、メタデータの有無に依存しない。
 
-```bash
-fpcalc -json {file.flac}
-# → {"duration": 245.3, "fingerprint": "AQAAB0kkRYqYREqOpEn..."}
-```
+### 3.2 指紋キャッシュ
 
-fingerprint は楽曲の音響的指紋 (MusicBrainz Picard / foobar2000 が使うのと同じ規格)。**メタデータ無関係に「同じ録音」を識別**。
+既存 `dsre_log.db` に新規テーブル `fingerprints (content_hash, duration_sec, fingerprint, last_path, computed_at)` を追加。content_hash = `md5(file_size + 先頭 64KB + 末尾 64KB)`。再走時の指紋再計算スキップ。ファイル移動・リネーム後も hash 一致で cache 適用。
 
-### 3.2 Fingerprint キャッシュ (SQLite)
+### 3.3 クラスタリング
 
-既存 `C:\FreeSoft\DSRE\dsre_log.db` に新規テーブル:
+全 file pairwise で指紋 Hamming 一致率を計算し、閾値以上のペアを union-find で連結。閾値は env で調整可能 (デフォルト 0.85、保守側)。
 
-```sql
-CREATE TABLE IF NOT EXISTS fingerprints (
-    content_hash TEXT PRIMARY KEY,
-    duration_sec REAL,
-    fingerprint TEXT,
-    last_path TEXT,
-    computed_at TEXT
-);
-```
+### 3.4 メタデータ伝播
 
-- `content_hash`: `md5(file_size_bytes + first_64KB + last_64KB)` で content-addressing
-- 再実行時は cache hit → fingerprint 再計算スキップ
-- ファイル移動・リネームは content_hash が同じなので影響なし
+各クラスタ内:
 
-### 3.3 クラスタリング (Union-Find)
+1. **canonical 選定** — タグ充実度を以下の加重で評価し最大値を持つ file:
+   - 主要タグ (artist, album, title, date, discnumber, tracknumber) 各 2 点
+   - 拡張タグ (genre, circle, brand, project, ...) 各 1 点
+   - アートワーク存在 3 点
+   - 同点は file サイズ大、それも同点なら path 辞書順 (決定的)
+2. **伝播対象** — 主要タグ + 拡張タグ + アートワーク (PICTURE ブロック)
+3. **絶対不変 (version 識別系)** — `version_info`, `cover_type`, `live_type`, `vocal_type`, `remaster_info`, `arrange_type`, `m_number`, `featuring`, `produced`
+4. **既値の尊重** — 伝播先 file が既に該当タグを持つ場合は上書きしない (ユーザー意図保護)
+5. **書き込み** — mutagen で in-place 更新、各 file の dsre_version タグはまだ立てない (STAGE 2 完了時に立つ)
 
-全 file pairwise で fingerprint 比較し、類似度 > 閾値ペアを union-find で連結:
+### 3.5 版分岐
 
-```python
-def similarity(fp_a: list[int], fp_b: list[int]) -> float:
-    """chromaprint fingerprint の Hamming 一致率 (0.0-1.0)"""
-    # 短い方を長い方に sliding window で重ね、最大一致率を返す
-    # bit-level XOR + popcount
-```
+伝播後、クラスタ内で version 識別系タグの組が異なる file を別 sub-cluster に分離する。同 sub-cluster 内は「version 含めて完全同一の真の重複」→ 採点で 1 つに絞る。複数 sub-cluster は別バージョンとして全て採点・処理対象。
 
-閾値デフォルト: **0.85** (env `DSRE_CLUSTER_SIMILARITY` で調整可能)。
+### 3.6 失敗時の縮退
 
-- 通常: 同曲の異なる版 (同マスター・別エンコード) は 0.90+ で一致
-- リマスター違い: 0.85-0.95
-- 完全別曲: 0.30 以下
-- 0.85 は false positive と false negative のバランス値
-
-### 3.4 メタデータ伝播 (canonical → cluster 内全 file)
-
-各 cluster 内で以下:
-
-1. **canonical 選定**: 「タグ充実度」最大の file を canonical とする
-   - 充実度スコア = 主要タグ (artist, album, title, discnumber, tracknumber, date, genre) の存在数 + アートワーク有無 (+1) + ジャンル系タグ存在 (+0.5 each)
-   - 同点なら mtime 新しい方
-2. **伝播対象タグ** (cluster 内全 file の対象タグが空 or 全 file 同一値 = 伝播):
-   - artist, album, title, discnumber, tracknumber, date, genre, age, circle, category, source, grouping, franchises, products, series, brand, subtitle, elements, project, collaboration, group, unit, album_type
-   - アートワーク (PICTURE ブロック)
-3. **絶対に伝播しない (version 識別系)**:
-   - `version_info`, `cover_type`, `live_type`, `vocal_type`, `remaster_info`, `arrange_type`, `m_number`
-   - `featuring`, `produced` (版ごとに変動する可能性)
-4. **既に値を持つタグは尊重**: cluster 内 file が canonical と異なる値を既に持つ → 上書きしない (ユーザー意図保護)
-
-伝播後、cluster 内全 file は: 共通タグ統一 + アートワーク統一 + version 系タグだけ各自独自。
-
-### 3.5 バージョン分離 (sub-cluster)
-
-メタデータ伝播後、cluster 内で **version 系タグの値が異なる file** は別 sub-cluster に分離:
-
-```python
-def sub_cluster_key(file) -> tuple:
-    return tuple(file.tags.get(k, "") for k in [
-        "version_info", "cover_type", "live_type", "vocal_type",
-        "remaster_info", "arrange_type", "m_number",
-    ])
-```
-
-同 sub-cluster 内の file は「真の重複」(version 系含め完全同一) → 1 つに絞る。
-sub-cluster が 2 個以上 → 別バージョンとして両方処理 (それぞれが独立に最良選択+処理)。
-
-### 3.6 5-key 整合検査 (sanity check)
-
-メタデータ伝播後、sub-cluster 内全 file の (artist, album, disc, track, title) が一致しているか確認:
-- 一致 → 通常進行
-- 不一致 → ログ警告 (伝播ロジックの bug 兆候、ユーザー側の手動タグ不整合の検出)
-
-### 3.7 Fingerprint 失敗・無効ファイル
-
-`fpcalc.exe` 失敗 (corrupt audio, unsupported format):
-- 該当 file は orphan singleton として扱う (cluster サイズ 1)
-- 警告ログ
-- 通常処理続行 (DSRE 処理は試みる)
+指紋取得失敗 (corrupt audio、binary 不在) → 該当 file は単独クラスタとして処理を継続。フラグ機能の上位が無効化されるだけで、DSRE 処理自体は失われない。
 
 ---
 
 ## 4. 客観品質スコアリング
 
-### 4.1 採点用 opus エンコード
+### 4.1 採点の本質
 
-音量正規化は **DSRE 既存の `save_flac24_out` 内 volume normalization をリファクタ抽出して流用** (true peak 8x oversampling → -0.3 dBFS target):
+ユーザー要件: 「clip=0 の最終状態で比較したい」。これは「音量に依存した clip 数の偏差を除去して各 file の本質的な音響特性を比べる」ことに等しい。clip=0 を達成すれば opus エンコードの有無で結果はほぼ変わらない。よって **採点用 opus 変換は行わない**。
 
-```python
-audio_norm = _dsre_normalize_volume(audio, sr)  # 既存ロジック抽出
-# tmp FLAC 経由で ffmpeg libopus 182k VBR
-subprocess.run([ffmpeg, "-i", tmp_flac, "-c:a", "libopus",
-                "-b:a", "182k", "-vbr", "on", "-application", "audio",
-                tmp_opus, "-y"], check=True)
-opus_audio, opus_sr = sf.read(tmp_opus)
-metrics = MetricsComputer.compute(opus_audio, opus_sr)
-score = calculate_score(metrics)
-# try/finally で tmp 削除
+### 4.2 採点手順
+
+```
+1. file 読み込み
+2. DSRE 既存 volume normalization を流用 (save_flac24_out から抽出)
+   → true peak -0.3 dBFS で clip=0 を構造保証
+3. 正規化済 PCM を MetricsComputer.compute() で 15 メトリクス取得
+4. スコア式を適用
+5. フラグ判定
 ```
 
-DSRE と同じ normalize → 「DSRE 処理後 opus 変換した最終形」を限りなく忠実にシミュレート。フェア比較の本質。
+### 4.3 リファクタ要件
 
-### 4.2 並列化
+既存 `save_flac24_out` 内の音量正規化処理を独立関数 `_dsre_normalize_volume(audio, sr) -> audio_norm` として抽出する。既存呼出側 (write 用) と新規採点側が同一実装を共有することで、採点と本処理の乖離リスクを構造的に排除する。
 
-`ThreadPoolExecutor(max_workers=os.cpu_count())`。tmp は per-future の try/finally で確実削除。
-
-### 4.3 スコア式 (初期値、env で調整可)
+### 4.4 スコア式 (初期値、env で調整可能)
 
 ```python
 score = 0.0
-score += clamp(dr, 0, 20) * 3.0               # max 60
-score += clamp(20 - abs(lufs + 14), 0, 20)     # max 20
+score += clamp(dr, 0, 20) * w_dr               # max 60
+score += clamp(20 - abs(lufs - lufs_target), 0, 20)  # max 20
 score += clamp(hf_ratio_12k, 0, 0.05) * 200    # max 10
 score += clamp(flatness, 0, 0.5) * 20          # max 10
-score -= max(0, 6 - plr) * 2                   # max -12
+score -= max(0, plr_floor - plr) * 2           # 最大 -12
 score = clamp(score, 0, 100)
 ```
 
-`clip_count` / `peak_db` は normalize で揃うため減点対象外。
+clip_count / peak_db は normalize で揃うため減点対象外。係数は実音源で観測しつつ env で調整。
 
-### 4.4 要注意フラグ (D: 数値良好でも実聴劣化)
+### 4.5 要注意フラグ (D: 数値良好でも実聴劣化)
 
 | 条件 | 検出意図 |
 |---|---|
-| `hf_ratio_16k < 0.0005` かつ `rolloff_hz < 17000` | 高域カット (lossy origin 疑い) |
+| `hf_ratio_16k` 極小 かつ `rolloff_hz < 17000` | 高域カット (lossy origin) |
 | `flatness < 0.05` | brick wall master |
-| `dr < 6` | ハイパー圧縮原音 |
-| `harmonic_1k_proxy > 0.5` かつ `dr > 12` | アーティファクト混入 |
-| `hf_ratio_8k > 0.3` かつ `centroid_hz > 6000` | 人工アップサンプル疑い |
+| `dr` 危険水準 | ハイパー圧縮 |
+| 高 `harmonic_1k_proxy` かつ 高 `dr` | 高 DR だが歪み多 |
+| 不自然な高域偏重 (centroid 高 + hf_8k 大) | 人工アップサンプル疑い |
 
-フラグはログのみ。デフォルトは確認なし自動進行。
+各閾値は env で調整可能。フラグはログのみ。
 
-### 4.5 最良選択
+### 4.6 最良選択
 
-```python
-def select_best(sub_cluster):
-    pool = [f for f in sub_cluster if not f.flagged] or sub_cluster
-    return max(pool, key=lambda f: (f.score, f.file_size))
-```
+フラグ無し集合の最高スコアを優先。フラグ無し集合が空ならフラグ付き集合から最高スコア (警告ログ)。同点はファイルサイズ大優先。
 
 ---
 
-## 5. ユーザー介入の最小化
+## 5. ユーザー介入最小化
 
-- **デフォルト**: 全 cluster 自動進行 (フラグ付きも警告ログだけで処理続行)
-- **`DSRE_INTERACTIVE_CONFIRM=1`**: 全フラグ群に UI 確認 (opt-in)
-- 事後レビュー: `OUTPUT_DIR/_workflow_log.txt` で全判断を追跡可能、ゴミ箱から復元可
+デフォルトはフラグ付きクラスタも警告ログのみで自動進行。`DSRE_INTERACTIVE_CONFIRM=1` で初めて UI 確認 (opt-in)。事後レビューは `OUTPUT_DIR/_workflow_log.txt`、復元はゴミ箱から。
 
 ---
 
 ## 6. foobar 互換フォルダ階層
 
-### 6.1 DSRE 適用テンプレ (OUTPUT_DIR = `C:\Audio\DSRE\Output\` 配下、`Audio/` プレフィックスは省略)
+### 6.1 階層構築ルール
 
+参考にしたユーザー foobar config の構造を、明示的ルールに再表現する。
+
+**1. カテゴリレベル (タグ存在で挿入、欠落で省略):**
 ```
-{OUTPUT_DIR}/
-  [{genre}/] [{age}/] [{circle}/] [{category}/] [{source}/] [{grouping}/]
-  [{franchises}/] [{products}/] [{series}/] [{brand}/]
-  [{subtitle}/] [{elements}/] [{project}/] [{collaboration}/]
-  [{group}/] [{unit}/] [{album_type}/]
-  [{year}/{month}/]
-  {album}[' ('date')'] /
-  [Disc {disc:02d}/]                      ← 単 disc アルバムでは省略
-  {disc:02d}.{track:03d}.{title}
-    [- {artist}[' [feat. 'featuring']']]
-    [' [Prod. 'produced']']
-    [' ['arrange_type']']
-    [' ['version_info']']
-    [' ['remaster_info']']
-    [' ['cover_type']']
-    [' ['live_type']']
-    [' ['vocal_type']']
-    [' ['m_number']']
-  .flac
+genre / age / circle / category / source / grouping
 ```
 
-各 `[...]` はタグ存在で挿入、欠落で省略。foobar 原テンプレートの `$if(%tag%, ..., )` 構造に準拠。
+**2. 作品識別レベル (親子重複排除を伴うタグ存在挿入):**
+```
+franchises / products / series / brand / subtitle / elements
+```
+親子重複排除ルール:
+- `franchises = project` なら franchises 省略
+- `products = project` または `products = brand` なら products 省略
+- `series = project` なら series 省略
+- `subtitle = brand` または `subtitle = franchises` なら subtitle 省略
+- `elements = brand` または `elements = franchises` または `elements = subtitle` なら elements 省略
 
-### 6.2 複数値タグの delimiter 置換
+これは「ある分類軸で値が等しい場合に下位レベルを冗長に作らない」ためのルール。
 
-foobar 原テンプレに従う:
-- artist の `/` → `_ `
-- featuring の `/` → `* `
-- arrange_type, version_info, remaster_info の `;` → ` /`
+**3. プロジェクト・グルーピングレベル:**
+```
+project / collaboration / group / unit / album_type
+```
 
-### 6.3 衝突回避
+**4. 時系列レベル (date タグから派生、date 存在時のみ):**
+```
+year(date) / month(date)
+```
 
-同パス既存 → 内容ハッシュ一致なら skip、相違なら `_2.flac`, `_3.flac` suffix。
+**5. アルバム + ディスク:**
+```
+{album}[" (" + date + ")"]      ← date 存在で suffix 追加
+Disc {disc:02d}                ← 単 disc アルバムでは省略
+```
 
-### 6.4 Windows パス制約
+**6. ファイル名:**
+```
+{disc:02d}.{track:03d}.{title}{artist 部}{修飾 [..] 群}.flac
+```
+
+artist 部:
+- `featuring` 存在: ` - {artist} [feat. {featuring}]`
+- 不在で artist 存在: ` - {artist}`
+- artist も不在: 省略
+
+修飾 `[..]` 群 (各タグが存在する分だけ列挙、不在で省略):
+```
+[Prod. {produced}]
+[{arrange_type}]
+[{version_info}]
+[{remaster_info}]
+[{cover_type}]
+[{live_type}]
+[{vocal_type}]
+[{m_number}]
+```
+
+### 6.2 OUTPUT_DIR 配下のパス組立
+
+OUTPUT_DIR (`C:\Audio\DSRE\Output\`) には既に `Audio/` が含まれるため、foobar 原テンプレ先頭の `Audio/[{device}]/` プレフィックスは DSRE 側では使わない。§6.1 のレベル 1 から直接展開する。
+
+### 6.3 複数値タグの delimiter 置換
+
+`artist` の `/` → `_ `、`featuring` の `/` → `* `、修飾 [..] 内の `;` → ` /`。foobar 原テンプレ準拠。
+
+### 6.4 衝突回避
+
+同パス既存:
+- 内容ハッシュ一致 → skip + ログ
+- 相違 → 数字 suffix `_2.flac`, `_3.flac`, ...
+
+### 6.5 Windows 制約
 
 - 禁止文字 `< > : " / \ | ? *` を全角に置換
 - 末尾 `.` / 空白を削除
-- 250 chars 超過: `\\?\` プレフィックス使用 (MAX_PATH 回避)、警告ログ
+- 250 chars 超過時 `\\?\` プレフィックス + 警告ログ
 
-### 6.5 単 disc 省略
+### 6.6 INPUT/OUTPUT 同型保証
 
-album 内の全 track の discnumber が "1" のみ → `Disc 01/` 階層省略。`DSRE_DISC_DIR_ALWAYS=1` で常時作成。
-
----
-
-## 7. STAGE 1: 処理前仕分け+リネーム
-
-最良 file 群を §6.1 テンプレで INPUT_DIR 内に再配置 (rename + sort)。
-ユーザーが INPUT_DIR を覗くと整理された階層が見える。STAGE 3 後と同型レイアウト。
+STAGE 1 (処理前) と STAGE 3 (処理後) は §6.1 の同一テンプレを使う。結果としてユーザーが INPUT_DIR を覗いても OUTPUT_DIR を覗いても 1:1 対応で同じ階層が見える。
 
 ---
 
-## 8. 破棄処理 (識別可能リネーム → ゴミ箱)
+## 7. 破棄処理
 
-非最良 file を send2trash 前に:
+非最良 file は send2trash の前に識別可能リネーム:
 ```
-{元のファイル名}.__discarded_dsre_inferior__.flac
+[DSRE-inferior] {元のファイル名}.flac
 ```
 
-ユーザーがゴミ箱を覗けば「DSRE が劣品質と判定して捨てた」と即識別可能。
-詳細は `OUTPUT_DIR/_workflow_log.txt` に追記。
+`[DSRE-inferior]` プレフィックスにより、ゴミ箱で名前順に並べたとき先頭付近に固まる + 「DSRE が劣品質と判定して捨てた」と即識別可能。破棄理由・スコア・フラグは `OUTPUT_DIR/_workflow_log.txt` に追記。
 
 ---
 
-## 9. STAGE 3: 処理後仕分け+リネーム
+## 8. 冪等性と再開
 
-DSRE 出力 FLAC を §6.1 同テンプレで OUTPUT_DIR 内配置。
-INPUT_DIR ↔ OUTPUT_DIR 1:1 同型。foobar から OUTPUT_DIR を直接読み込み既存設定で opus 変換可能。
+冪等性: 各 file の `dsre_version` Vorbis Comment タグを確認 → 存在すれば skip。何度開始しても破壊しない。
 
----
-
-## 10. 冪等性 (再実行安全)
-
-各 file の `dsre_version` Vorbis Comment タグを確認 → 存在すれば skip。
-ユーザーが何度「開始」しても破壊的変更なし。
+再開: journal なし。状態は filesystem + tag が自己記述する。任意の STAGE での中断後、再走で続きから進む。
 
 ---
 
-## 11. 失敗時リジューム
+## 9. 処理順序
 
-journal なし。状態はファイル配置 + tag が自己記述:
-
-- STAGE 1 中断: 仕分け済 file は新パスに、未処理は旧位置。再走時 `dsre_version` 無 file を再スキャン。
-- STAGE 2 中断: DSRE 済 file は OUTPUT_DIR (タグ済)、未処理は INPUT_DIR の仕分け先に残置。
-- STAGE 3 中断: 仕分け待ち file は OUTPUT_DIR ルート残置。再走で仕分けのみ。
-
-冪等性 (§10) と組み合わせ、任意の中断後に完全再開。
+ORDER BY artist, album, discnumber, tracknumber。I/O ローカリティと進捗の自然さ。
 
 ---
 
-## 12. 処理順序
+## 10. UI
 
-```
-ORDER BY artist, album, discnumber, tracknumber
-```
-
-I/O ローカリティ + 進捗の自然さ。fingerprint cluster は metadata 伝播後にこの並びで処理。
+既存維持。進捗テキストは STAGE と件数を構造化して表示する。要確認ダイアログはデフォルト OFF (§5)。
 
 ---
 
-## 13. UI (MainWindow)
+## 11. 新規モジュール
 
-既存維持 + 進捗テキスト改善:
-```
-[STAGE 1] スキャン 30 files (0 既処理)
-[STAGE 1] Fingerprinting 30/30 (cache 18 hit, 12 計算)
-[STAGE 1] クラスタリング 10 cluster
-[STAGE 1] メタデータ伝播 10/10 (20 file に補完)
-[STAGE 1] 採点 並列 30/30
-[STAGE 1] 最良選択 完了、破棄 20
-[STAGE 1] 整列 INPUT_DIR
-[STAGE 2] DSRE [3/10] {album}/{track}
-[STAGE 3] 整列 OUTPUT_DIR
-完了 10/10 (要確認 0)
-```
+| クラス/関数 | 責務 |
+|---|---|
+| `FingerprintEngine` | fpcalc subprocess + SQLite cache |
+| `ClusterBuilder` | pairwise 類似度 + union-find |
+| `MetadataExtractor` | mutagen による多タグ抽出 |
+| `MetadataPropagator` | canonical 選定 + 伝播 + 既値尊重 + 版分岐 |
+| `QualityProbe` | 正規化 + 解析 (opus なし、§4.2) |
+| `BestSelector` | sub-cluster 内最良選択 |
+| `DiscardHandler` | 識別可能リネーム + send2trash |
+| `FoobarPathBuilder` | §6.1 のルールに基づくパス構築 + サニタイズ + 長パス対応 |
+| `WorkflowOrchestrator` | STAGE 1-3 統括 |
 
-要確認ダイアログはデフォルト OFF (§5)。
+リファクタ: `save_flac24_out` 内 volume normalization 抽出 → `_dsre_normalize_volume(audio, sr)` (純関数化、既存呼出側と新規 `QualityProbe` 両方が呼ぶ)。
 
 ---
 
-## 14. 新規モジュール
+## 12. 依存
 
-| クラス | 責務 | 既存依存 |
-|---|---|---|
-| `FingerprintEngine` | fpcalc.exe subprocess + SQLite cache | sqlite3 |
-| `ClusterBuilder` | pairwise 類似度 + union-find | (純関数) |
-| `MetadataExtractor` | mutagen で 25+ タグ抽出 | mutagen |
-| `MetadataPropagator` | canonical 選定 + cluster 内伝播 + version 系保護 | mutagen |
-| `VersionSplitter` | cluster → sub-cluster (version 系タグ差分で) | (純関数) |
-| `QualityProbe` | DSRE normalize 流用 + opus encode + decode + 解析 | ffmpeg, MetricsComputer, DSRE 既存 (リファクタ抽出) |
-| `BestSelector` | sub-cluster 内最良 (フラグ判定込み) | (純関数) |
-| `DiscardHandler` | 識別可能リネーム + send2trash | send2trash |
-| `FoobarPathBuilder` | テンプレ展開 (optional level / suffix、サニタイズ、長パス) | (純関数) |
-| `WorkflowOrchestrator` | STAGE 1-3 統括、冪等性 + リジューム制御 | 全部 |
+### バイナリ
+- `fpcalc.exe` (chromaprint 公式) を DSRE バンドルに追加 (~500KB)、`_internal/ffmpeg/` 配下
 
-リファクタ: 既存 `save_flac24_out` 内 volume normalization 部分を `_dsre_normalize_volume(audio, sr)` として独立関数化 (既存呼出側と新規 QualityProbe 両方が呼ぶ)。
+### Python
+- 追加なし。fpcalc は subprocess、指紋比較は自前実装 (decode + Hamming + best-alignment)
+
+### DSRE.spec
+- `fpcalc.exe` の datas 配置追加
 
 ---
 
-## 15. 依存追加
-
-### 15.1 バイナリ
-- `fpcalc.exe` (chromaprint 公式配布) を DSRE バンドルに追加 (~500KB)
-- 配置: `_internal/ffmpeg/fpcalc.exe` (ffmpeg と並列)
-- 検索ロジック: 既存 ffmpeg と同じ resource path 解決
-
-### 15.2 Python (requirements.txt)
-追加なし。fpcalc は subprocess で呼ぶだけ。fingerprint 比較は自前実装 (~30 行、chromaprint の base64-like 文字列を int32 list に decode → Hamming 比較)。
-
-### 15.3 DSRE.spec
-- `fpcalc.exe` のバンドルに対応するため datas にエントリ追加
-
----
-
-## 16. 変更ファイル
+## 13. 変更ファイル
 
 | ファイル | 変更種別 | 概要 |
 |---|---|---|
-| `DSRE.py` | 大幅追加 + リファクタ | 10 新クラス、Worker 改修、Orchestrator 統括、`save_flac24_out` の normalize 抽出、SQLite 新テーブル |
-| `DSRE.spec` | 修正 | `fpcalc.exe` バンドル設定追加 |
-| `_ffmpeg/fpcalc.exe` | 新規配置 | chromaprint 公式 binary |
-| `requirements.txt` | 変更なし | - |
+| `DSRE.py` | 大幅追加 + 軽微リファクタ | 9 新モジュール、Worker 改修、Orchestrator 統括、`save_flac24_out` の volume norm 抽出、SQLite 新テーブル |
+| `DSRE.spec` | 修正 | `fpcalc.exe` バンドル |
+| `_internal/ffmpeg/fpcalc.exe` | 新規配置 | chromaprint 公式 binary |
 
 ---
 
-## 17. テスト計画
+## 14. テスト計画
 
-| 検証項目 | 方法 | 合格基準 |
-|---|---|---|
-| Fingerprint 計算 | 任意 FLAC | duration + fp 取得 |
-| Fingerprint キャッシュ | 2 回計算 | 2 回目は cache hit |
-| クラスタ similarity | 同 audio 2 file | similarity > 0.95 |
-| クラスタ separation | 別曲 2 file | similarity < 0.5 |
-| Union-find | 3 file 連鎖一致 | 1 cluster |
-| canonical 選定 | タグ違い 3 file | 最多タグ持ち選出 |
-| メタデータ伝播 | 1 tagged + 2 untagged | 2 untagged に同タグ + artwork |
-| version 系タグ保護 | live_type 異なる 2 file | 上書きされない |
-| 既値尊重 | canonical と異なる genre 持ち | 上書きしない |
-| sub-cluster 分割 | version_info 異 2 file | 2 sub-cluster |
-| 5-key sanity 不一致警告 | mock 異常 | ログ警告出力 |
-| 採点 normalize | clip 大量 file | clip=0 達成 |
-| opus tmp 削除 | 通常 + 中断 | tmp 漏れなし |
-| スコア値 高品質 | mock | score > 80 |
-| フラグ HF cliff | rolloff=15k hf_16k=0 | flagged |
-| 最良選択 全 clean | 3 件 | max score |
-| 最良選択 全 flagged | 3 件 | max + フラグ維持 |
-| 破棄リネーム | non-best | `__discarded_dsre_inferior__` suffix |
-| FoobarPath all tags | full metadata | テンプレ完全展開 |
-| FoobarPath missing | 一部欠落 | 該当 level 省略 |
-| FoobarPath サニタイズ | `?` 入り | 全角化 |
-| FoobarPath 長パス | >250 chars | `\\?\` プレフィックス |
-| FoobarPath delimiter | artist に `/` | `_ ` 置換 |
-| 単 disc 省略 | 全 disc=1 | Disc 階層なし |
-| 衝突回避 | 同パス | `_2.flac` |
-| 冪等性 | 既処理 file | skip |
-| リジューム | STAGE 2 中断 + 再走 | 続き処理 |
-| 統合 (10×3 file mock) | クラスタ → 伝播 → 処理 → 整列 | INPUT/OUTPUT 同型レイアウト + ゴミ箱に 20 識別済 file |
-| selftest | `--selftest` | verdict=EQUIV |
+| 検証項目 | 合格基準 |
+|---|---|
+| 指紋計算 | duration + fp 取得 |
+| 指紋キャッシュ | 2 回目は cache hit |
+| クラスタ similarity 高 | 同 audio で類似率 > 0.95 |
+| クラスタ separation | 別曲で類似率 < 0.5 |
+| Union-find 連鎖 | 推移的連結 |
+| canonical 選定 | 加重で最多タグ持ち選出 |
+| メタデータ伝播 | 未タグ file に canonical のタグ + アートワーク |
+| version 系タグ保護 | 触らない |
+| 既値尊重 | 上書きしない |
+| 版分岐 | version 系タグ差分で sub-cluster 分離 |
+| 採点 normalize | clip=0 達成 |
+| 採点 高品質 mock | score > 80 |
+| フラグ各種 | 該当条件で立つ |
+| 最良選択 全 clean | max score |
+| 最良選択 全 flagged | max + warn |
+| 破棄リネーム | `[DSRE-inferior]` プレフィックス |
+| ゴミ箱投入 | send2trash 成功 |
+| FoobarPath 各種 (full / partial / sanitize / 長パス / delimiter) | テンプレ規則通り |
+| 単 disc 省略 | Disc 階層なし |
+| 衝突回避 | 数字 suffix |
+| 冪等性 | 既処理 file skip |
+| 再開 (STAGE 2 中断) | 再走で続き処理 |
+| 統合 (multi-version mock) | INPUT/OUTPUT 同型 + 破棄 file 識別可能 |
+| selftest | verdict=EQUIV |
 
 ---
 
-## 18. 設定可能パラメータ (env var)
+## 15. 設定可能パラメータ (env)
 
 | env var | デフォルト | 説明 |
 |---|---|---|
 | `DSRE_WORKFLOW` | `1` | 0 で旧パイプライン (Sub-A 状態) |
-| `DSRE_PRESORT_INPUT` | `1` | 0 で STAGE 1 の仕分け skip |
-| `DSRE_CLUSTER_SIMILARITY` | `0.85` | fingerprint 類似度閾値 |
-| `DSRE_HARMONIZE_METADATA` | `1` | 0 でメタデータ伝播を無効化 |
-| `DSRE_SCORE_OPUS_BITRATE` | `182k` | 採点用 opus ビットレート |
-| `DSRE_INTERACTIVE_CONFIRM` | `0` | 1 でフラグ群に UI ダイアログ (opt-in) |
-| `DSRE_DISC_DIR_ALWAYS` | `0` | 1 で単 disc アルバムでも `Disc 01/` 作成 |
-| `DSRE_SCORE_WEIGHT_DR` | `3.0` | スコア式 DR 係数 |
+| `DSRE_PRESORT_INPUT` | `1` | 0 で STAGE 1 仕分け skip |
+| `DSRE_CLUSTER_SIMILARITY` | `0.85` | 指紋類似度閾値 |
+| `DSRE_HARMONIZE_METADATA` | `1` | 0 で伝播無効 |
+| `DSRE_INTERACTIVE_CONFIRM` | `0` | 1 でフラグ群に UI ダイアログ |
+| `DSRE_DISC_DIR_ALWAYS` | `0` | 1 で単 disc でも `Disc 01/` |
 | `DSRE_SCORE_LUFS_TARGET` | `-14` | LUFS 目標値 |
+| `DSRE_SCORE_WEIGHT_DR` | `3.0` | DR 係数 |
 
 ---
 
-## 19. リスク と 緩和策
+## 16. リスク と 緩和
 
 | リスク | 緩和 |
 |---|---|
-| fingerprint 誤クラスタ (false positive) | 閾値 0.85 (高保守的) + 内容ハッシュ verify (同 cluster 内で content hash 完全一致 → 真の重複) |
-| fingerprint 取りこぼし (false negative) | 単独 singleton として通常処理続行 (損失なし) |
-| canonical 選定が間違う | 「既値尊重」ルールでユーザー意図保護 / 伝播ログ詳細記録 |
-| version 系タグ消失 | 伝播対象外 リスト で絶対保護 |
-| メタデータ書き換えで PICTURE 喪失 | mutagen の clear_pictures + add_picture 順序、Sub-A の知見流用 |
-| fpcalc.exe 配布漏れ | spec で明示バンドル + 起動時存在確認 + ない場合は警告して fp 機能無効化 (単独 group 扱いで処理続行) |
-| 並列採点で CPU 飽和 | max_workers 制御 + UI で進捗表示 |
-| Windows 長パス | `\\?\` + 警告ログ |
-| 重要バージョン誤判定で破棄 | 識別 rename + ゴミ箱で復元 / version 系タグ 7 種で過剰統合防止 |
-| 「数値良好だが実聴劣化」検出漏れ | 5 種フラグ + opt-in 確認ダイアログ |
+| 指紋誤クラスタ (false positive) | 閾値高め (0.85) + 内容ハッシュ完全一致時のみ「真の重複」と扱う |
+| 指紋取りこぼし (false negative) | 単独クラスタとして処理続行 (損失なし) |
+| canonical 誤判定 | 既値尊重ルール + 伝播ログ |
+| version 系タグ消失 | 不変リストで構造保護 |
+| アートワーク喪失 | mutagen clear+add 順序、Sub-A の知見流用 |
+| fpcalc.exe 不在 | 警告 + 指紋機能無効化 (単独クラスタ扱いで処理続行) |
+| Windows 長パス | `\\?\` + 警告 |
+| 採点と本処理の正規化乖離 | 同一関数の共有 (リファクタで構造保証) |
+| 「数値良好で実聴劣化」 | 5 フラグ + 任意 opt-in 確認 |
 
 ---
 
-## 20. Out of Scope (将来 sub-project)
+## 17. Out of Scope
 
-- **Sub-project C**: メタデータ自動取得 (VGMDB/MusicBrainz/iTunes/AppleMusic API)
-  - 設定差異 (VGMDB: CV声優名、MusicBrainz: キャラ名) のため完全自動化は人間確認残り
-  - DSRE 本体ではなく別ツール推奨
-  - **本設計は「1 版だけタグ済」状態を想定** → C を実装すれば「0 版タグ済」も対応可能になる
-- **foobar での opus 変換**: ユーザー従来通り
-- **AcoustID API 連携**: chromaprint fingerprint を AcoustID (MusicBrainz) に投げて global lookup → メタデータ自動取得。Sub-C 範囲。
+- **Sub-project C**: メタデータ自動取得 (AcoustID/MusicBrainz/VGMDB/iTunes/Apple Music)。本設計は「一部 file がタグ済」を前提とするが、C を実装すれば「全 file 未タグ」状態でも完結可能になる。
+- **foobar 経由 opus 変換**: ユーザー従来通り。
 
 ---
 
-## 21. 設計上の核心ロジック (要旨)
+## 18. 設計核心 (1 文)
 
-ユーザーの実ワークフローを構造的に解決する 1 文:
-
-> **「同曲は metadata でなく acoustic fingerprint で識別する。metadata は fingerprint cluster 内で 1 file から自動伝播する。これにより 30 file 中 10 file だけタグ取得すれば残り 20 file は DSRE が補完する。」**
-
-これが v4 の構造的核心。残りの全 section はこの核心からの派生実装詳細。
+> **同曲識別を音響指紋に基盤を移し、メタデータをクラスタ内伝播で自動補完し、採点を clip=0 正規化 PCM の直接解析にすることで、タグ整備が不完全な raw 投入から整列出力までを最小手動介入で達成する。**
