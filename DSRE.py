@@ -680,6 +680,39 @@ def _extract_flac_pictures(path: str) -> list:
         return []
 
 
+def _embed_output_metadata(
+    path: str,
+    pictures: list,
+    before_m: dict,
+    after_m: dict,
+    level: int,
+) -> None:
+    """処理済 FLAC に PICTURE ブロック + カスタム Vorbis Comment タグを埋め込む。失敗は握り潰す。"""
+    try:
+        import datetime
+        from mutagen.flac import FLAC
+        f = FLAC(path)
+        # PICTURE ブロック再注入 (元の順序で)
+        f.clear_pictures()
+        for pic in pictures:
+            f.add_picture(pic)
+        # カスタムタグ (小文字: FLAC Vorbis Comment 規約)
+        if f.tags is None:
+            f.add_tags()
+        f.tags["dsre_version"] = [_get_dsre_version()]
+        f.tags["dsre_processed_utc"] = [datetime.datetime.utcnow().isoformat()]
+        f.tags["dsre_level"] = [str(level)]
+        for k, v in before_m.items():
+            if v is not None:
+                f.tags[f"dsre_before_{k}"] = [str(round(float(v), 6))]
+        for k, v in after_m.items():
+            if v is not None:
+                f.tags[f"dsre_after_{k}"] = [str(round(float(v), 6))]
+        f.save()
+    except Exception:
+        pass  # メタデータ失敗は本処理をブロックしない
+
+
 # ===== バンドルリソースのパス解決 =====
 def _resource_base_dirs() -> tuple[str, ...]:
     """PyInstaller onedir / 開発実行の両方で同梱リソースを探すためのベースディレクトリ群。"""
