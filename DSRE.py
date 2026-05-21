@@ -702,7 +702,7 @@ def _embed_output_metadata(
         # カスタムタグ (小文字: FLAC Vorbis Comment 規約)
         if f.tags is None:
             f.add_tags()
-        f.tags["dsre_version"] = [_get_dsre_version()]
+        f.tags["dsre_version"] = [_DSRE_VERSION]
         f.tags["dsre_processed_utc"] = [datetime.datetime.utcnow().isoformat()]
         f.tags["dsre_level"] = [str(level)]
         for k, v in before_m.items():
@@ -1923,6 +1923,8 @@ class MetricsTab(QtWidgets.QWidget):
         hist_layout.addWidget(self._metric_combo_hist)
         if self._pg:
             self._hist_plot = self._pg.PlotWidget()
+            self._hist_legend = self._hist_plot.addLegend()
+            self._hist_legend.setOffset((10, 10))
             hist_layout.addWidget(self._hist_plot)
         else:
             self._hist_plot = None
@@ -1976,25 +1978,30 @@ class MetricsTab(QtWidgets.QWidget):
         rows = self._load_batch()
         before_key = f"{key}_b"
         after_key = f"{key}_a"
-        before_vals = [r.get(before_key) for r in rows if r.get(before_key) is not None]
-        after_vals = [r.get(after_key) for r in rows if r.get(after_key) is not None]
-        n = min(len(before_vals), len(after_vals))
-        if n == 0:
+        pairs = [
+            (r.get(before_key), r.get(after_key))
+            for r in rows
+            if r.get(before_key) is not None and r.get(after_key) is not None
+        ]
+        if not pairs:
             self._batch_plot.clear()
             return
-        x = list(range(n))
+        before_vals, after_vals = zip(*pairs)
+        before_vals = list(before_vals)
+        after_vals = list(after_vals)
+        x = list(range(len(pairs)))
         bar_width = 0.35
         self._batch_plot.clear()
         bg = self._pg.BarGraphItem(
             x=[xi - bar_width / 2 for xi in x],
-            height=before_vals[:n],
+            height=before_vals,
             width=bar_width,
             brush="#607D8B",
             name="Before",
         )
         ba = self._pg.BarGraphItem(
             x=[xi + bar_width / 2 for xi in x],
-            height=after_vals[:n],
+            height=after_vals,
             width=bar_width,
             brush="#4CAF50",
             name="After",
@@ -2017,6 +2024,7 @@ class MetricsTab(QtWidgets.QWidget):
         after_vals = [r.get(after_key) for r in rows]
         xs = list(range(len(rows)))
         self._hist_plot.clear()
+        self._hist_legend.clear()
         b_clean = [(i, v) for i, v in zip(xs, before_vals) if v is not None]
         a_clean = [(i, v) for i, v in zip(xs, after_vals) if v is not None]
         if b_clean:
@@ -2027,8 +2035,6 @@ class MetricsTab(QtWidgets.QWidget):
             self._hist_plot.plot(list(ax), list(ay), pen="#4CAF50", name="After")
         self._hist_plot.setLabel("bottom", "Run index")
         self._hist_plot.setLabel("left", self._metric_combo_hist.currentText())
-        legend = self._hist_plot.addLegend()
-        legend.setOffset((10, 10))
 
 
 class _NullCtx:
@@ -2263,10 +2269,7 @@ class Worker(QtCore.QThread):
                     return "verify_fail"
                 _log_failure(path, "save_fail", e)
                 raise
-            try:
-                _embed_output_metadata(out, pictures, before_m, after_m, lv)
-            except Exception:
-                pass
+            _embed_output_metadata(out, pictures, before_m, after_m, lv)
             _check_abort()
 
             try:
