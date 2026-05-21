@@ -601,16 +601,19 @@ class AudioMetricsLogger:
         adaptive_layers=None,
         adaptive_mode=None,
         hf_ratio_input=None,
+        _before_metrics: "dict | None" = None,
+        _after_metrics: "dict | None" = None,
     ) -> None:
         """
         メトリクスを計算して DB に 1 行追記。例外は握り潰す（処理をブロックしない）。
         input_audio: 96k リサンプル済の処理前音声 (numpy array)
         output_audio: zansei_impl 処理後音声 (numpy array)
+        _before_metrics / _after_metrics: 事前計算済みの場合は MetricsComputer を再呼びしない。
         """
         try:
             import datetime
-            b = MetricsComputer.compute(input_audio, sr)
-            a = MetricsComputer.compute(output_audio, sr)
+            b = _before_metrics if _before_metrics is not None else MetricsComputer.compute(input_audio, sr)
+            a = _after_metrics if _after_metrics is not None else MetricsComputer.compute(output_audio, sr)
 
             if input_audio.ndim == 2:
                 channels = input_audio.shape[0]
