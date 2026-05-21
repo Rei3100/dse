@@ -2427,20 +2427,34 @@ class MainWindow(QtWidgets.QWidget):
         self.sld_level.setTickInterval(1)
         self.lbl_level = QtWidgets.QLabel(f"負荷 {_lv}/{LOAD_LEVEL_MAX}")
 
-        layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.label)
-        layout.addWidget(self.pb_file)
-        layout.addWidget(self.pb_all)
-        layout.addWidget(self.btn_start)
-        layout.addWidget(self.btn_pause)
-        layout.addWidget(self.btn_cancel)
-
+        # ---- 処理タブ (既存UIを QWidget でラップ) ----
+        proc_widget = QtWidgets.QWidget()
+        proc_layout = QtWidgets.QVBoxLayout(proc_widget)
+        proc_layout.addWidget(self.label)
+        proc_layout.addWidget(self.pb_file)
+        proc_layout.addWidget(self.pb_all)
+        proc_layout.addWidget(self.btn_start)
+        proc_layout.addWidget(self.btn_pause)
+        proc_layout.addWidget(self.btn_cancel)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.lbl_level)
         row.addWidget(self.sld_level, 1)
-        layout.addLayout(row)
+        proc_layout.addLayout(row)
 
-        self.setLayout(layout)
+        # ---- グラフタブ ----
+        self.metrics_tab = MetricsTab()
+
+        # ---- タブウィジェット ----
+        self._tabs = QtWidgets.QTabWidget()
+        self._tabs.addTab(proc_widget, "処理")
+        self._tabs.addTab(self.metrics_tab, "グラフ")
+
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self._tabs)
+        self.setLayout(main_layout)
+
+        self.resize(400, 280)
 
         self.btn_start.clicked.connect(self.start)
         self.btn_pause.clicked.connect(self.pause)
@@ -2577,6 +2591,7 @@ class MainWindow(QtWidgets.QWidget):
         self.worker.sig_step.connect(self.pb_file.setValue)
         self.worker.sig_all.connect(self.pb_all.setValue)
         self.worker.sig_text.connect(self.label.setText)
+        self.worker.finished.connect(self.metrics_tab.refresh)
         self.worker.start()
 
     def pause(self):
