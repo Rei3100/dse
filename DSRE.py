@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r142"
+_DSRE_VERSION = "r143"
 
 
 # ===== DSP パラメータ =====
@@ -1025,17 +1025,17 @@ class MetadataExtractor:
         from mutagen.flac import FLAC
         out = {k: "" for k in _METADATA_FIELDS}
         out["__path__"] = path
-        raw = {}
+        raw = {}          # 小文字キー → 全値リスト (多値タグ保持)
         try:
             f = FLAC(path)
             if f.tags:
                 for key in f.tags.keys():
                     vals = f.tags.get(key)
                     if vals:
-                        raw.setdefault(key.lower(), str(vals[0]))
+                        raw.setdefault(key.lower(), [str(v) for v in vals])
             for key in _METADATA_FIELDS:
                 if raw.get(key):
-                    out[key] = raw[key]
+                    out[key] = raw[key][0]
             out["__pictures__"] = list(f.pictures)
         except Exception:
             out["__pictures__"] = []
@@ -1050,11 +1050,16 @@ _VERSION_TAGS = frozenset([
     "featuring", "produced",
 ])
 
-# per-file 技術タグ: その音源固有の値なので統一しない (残す側・破棄側で別々で正しい)。
-# DSRE 処理後に再計算される loudness/peak 系、エンコーダ情報、処理マーカー等。
+# per-file タグ: その音源固有の値なので統一しない (残す側・破棄側で別々で正しい)。
+#  - loudness/peak/エンコーダ/処理マーカー: DSRE 処理後に再計算/付与される技術値
+#  - 再生履歴・ライブラリ状態: ファイル個別の利用状況 (曲の同一性ではない)
+#  - 自由記述 (description/comment): 出所メモ等の個別注記 (junk 混入を防ぐため統一しない)
 _TECHNICAL_TAGS = frozenset([
     "dynamic range", "encoder", "encoded_by", "created",
     "dsre_version", "dsre_processed_utc", "comment_dsre",
+    "play_count", "first_played_timestamp", "last_played_timestamp",
+    "added_timestamp", "first_played", "last_played", "rating",
+    "description", "comment",
 ])
 _TECHNICAL_PREFIXES = ("replaygain_", "truepeak_scanner_", "r128_")
 
@@ -1111,29 +1116,36 @@ class MetadataPropagator:
         return max(group, key=MetadataPropagator._score)
 
     @staticmethod
+    def build_merged_identity(group: list) -> dict:
+        """cluster 全 file の identity タグの **和集合** を作る (多値保持)。
+        各タグは最完備 file 優先で値を採る (junk 側に潰されない)。version 識別タグ・
+        per-file 技術タグ・再生履歴・自由記述は対象外 (各 file 固有を保つ)。
+        戻り値: {lower_key: [values]}。"""
+        merged = {}
+        # 完備度スコア降順 = 最も「ちゃんとしてる」file を先頭に。setdefault で先勝ち。
+        ordered = sorted(group, key=MetadataPropagator._score, reverse=True)
+        for m in ordered:
+            for kl, vals in (m.get("__rawtags__") or {}).items():
+                if vals and _is_identity_tag(kl):
+                    merged.setdefault(kl, list(vals))
+        return merged
+
+    @staticmethod
     def propagate(group: list) -> None:
-        """sub-cluster (同曲・同版) 内で canonical の非 version メタを他 file に統一する。
-        空欄補完ではなく **上書き統一**: 最良音質 file が低メタ側でも、破棄側でも、
-        全 file が canonical と同一メタになる (差を残さない = ユーザー要件)。
-        canonical は完備度スコア最大の file なので、未取得側を基準にして良メタを
-        潰す事故は起きない。version 識別系タグ (_VERSION_TAGS) だけは版を区別する
-        ため絶対に触らない。"""
+        """cluster 内で identity メタを **和集合統一** する。最完備 file 優先で衝突解決し、
+        どの file にしか無いタグも取りこぼさない (union)。残す側 (最良音質) が低メタ/junk
+        側でも、破棄側でも、全 file が同一の最良メタになる (差を残さない = ユーザー要件)。
+        version 識別タグ・per-file 技術タグ・再生履歴・description は各 file 固有を保つ。"""
         if os.environ.get("DSRE_HARMONIZE_METADATA") == "0":
             return
         if len(group) < 2:
             return
-        canon = MetadataPropagator.choose_canonical(group)
-        canon_raw = canon.get("__rawtags__", {})
-        # 統一すべき canonical の identity タグ集合 (小文字キー → 値)
-        canon_ident = {k: v for k, v in canon_raw.items()
-                       if v and _is_identity_tag(k)}
-        # cluster 内の jxl アートワークを 1 枚拾う (canonical 優先、無ければ任意 file)。
-        # 最終アートワークは jxl のみ。jxl 以外は統合しない (ユーザー指定)。
-        jxl_pic = MetadataPropagator._find_jxl_picture([canon] + group)
+        merged = MetadataPropagator.build_merged_identity(group)
+        # 最終アートワークは jxl のみ統合 (jxl 以外は触らない)。
+        jxl_pic = MetadataPropagator._find_jxl_picture(
+            sorted(group, key=MetadataPropagator._score, reverse=True))
         from mutagen.flac import FLAC
         for m in group:
-            if m["__path__"] == canon["__path__"]:
-                continue
             try:
                 f = FLAC(m["__path__"])
                 if f.tags is None:
@@ -1142,36 +1154,27 @@ class MetadataPropagator:
                 existing = {}
                 for k in list(f.tags.keys()):
                     existing.setdefault(k.lower(), k)
-                # 1) canonical の identity タグを全て上書き設定
-                for kl, cv in canon_ident.items():
-                    cur = f.tags.get(existing.get(kl, kl))
-                    if cur and str(cur[0]) == cv:
+                # 1) 和集合 identity タグを全て設定 (多値保持)
+                for kl, vals in merged.items():
+                    realk = existing.get(kl, kl)
+                    cur = f.tags.get(realk)
+                    if cur and [str(x) for x in cur] == vals:
                         continue
-                    f[existing.get(kl, kl)] = [cv]
+                    f[realk] = list(vals)
                     changed = True
-                # 2) target 固有の identity タグ (canonical に無い) を削除し差を消す。
+                # 2) merged に無い target 固有の identity タグを削除し差を消す
                 for kl, realk in list(existing.items()):
-                    if kl in canon_ident or not _is_identity_tag(kl):
+                    if kl in merged or not _is_identity_tag(kl):
                         continue
                     del f[realk]
                     changed = True
-                # 3) jxl アートワーク: target が jxl を持たず cluster に jxl があれば付与
+                # 3) jxl アートワーク: 持たない file に cluster の jxl を付与
                 if jxl_pic is not None and not _has_jxl_picture(m.get("__pictures__")):
                     f.clear_pictures()
                     f.add_picture(jxl_pic)
                     changed = True
                 if changed:
                     f.save()
-            except Exception:
-                pass
-        # canonical 自身が jxl を持たず cluster の他 file に jxl がある場合、canonical
-        # にも付与する (最良が canonical でアートワーク無し、を防ぐ)。
-        if jxl_pic is not None and not _has_jxl_picture(canon.get("__pictures__")):
-            try:
-                cf = FLAC(canon["__path__"])
-                cf.clear_pictures()
-                cf.add_picture(jxl_pic)
-                cf.save()
             except Exception:
                 pass
 
@@ -1647,7 +1650,7 @@ class WorkflowOrchestrator:
         """chroma 時系列相関で paths を同曲 cluster 化。解析不能 file は単独 cluster。
         メタデータには一切依存しない (タグが違っても同曲なら束ねる、が設計意図)。
         chromaprint Hamming は同一録音しか検出できず別歌唱を取りこぼすため不使用。"""
-        threshold = float(os.environ.get("DSRE_CLUSTER_SIMILARITY", "0.65"))
+        threshold = float(os.environ.get("DSRE_CLUSTER_SIMILARITY", "0.42"))
         ch_map = {}
         for i, p in enumerate(paths, 1):
             self.progress_cb(f"[STAGE 1] 解析 {i}/{len(paths)}")
@@ -1754,12 +1757,12 @@ class WorkflowOrchestrator:
         for c in clusters:
             if self.abort_cb():
                 break
+            # acoustic に同曲と判定された cluster は、版違い ([Cover]/[mqms2] 等) でも
+            # 1 つの最良 (音質) に dedup する。version タグでの分割はしない (同曲は同曲)。
             meta = self.harmonize_metadata(c)
-            subs = split_versions(meta)
-            for sub in subs:
-                best = self.process_subcluster(sub)
-                if best:
-                    bests.append(best)
+            best = self.process_subcluster(meta)
+            if best:
+                bests.append(best)
             all_meta.extend(meta)
 
         self.progress_cb(f"[STAGE 1] 最良選択 {len(bests)} 完了")

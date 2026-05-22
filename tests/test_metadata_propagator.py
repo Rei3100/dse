@@ -138,10 +138,54 @@ def test_unify_covers_arbitrary_and_future_tags():
         assert bf["lyricist"][0] == "LY"
         assert bf["customtag"][0] == "CUSTOM"
         assert bf["artist"][0] == "X"
-        # canonical に無い target 固有 identity タグは削除 (差を消す)
-        assert "description" not in bf
+        # description は per-file 自由記述 (junk 混入を防ぐため統一/削除しない)
+        assert bf["description"][0] == "b-only"
         # per-file 技術タグは b 自身の値を保持 (統一しない)
         assert bf["replaygain_track_range"][0] == "2.67 LU"
+
+
+def test_union_merge_replaces_junk_and_keeps_all_identity():
+    """junk メタ側 (artist=ewqwe 等) は良メタ側に統一され、どこか 1 file にしか
+    無い identity タグも全 file に行き渡る (和集合・最完備優先)。"""
+    from DSRE import MetadataPropagator, MetadataExtractor
+    from mutagen.flac import FLAC
+    with tempfile.TemporaryDirectory() as d:
+        good = os.path.join(d, "good.flac")
+        _mk(good, {"artist": "天海春香", "title": "ムーンライト伝説",
+                   "album": "AL", "category": "Publication",
+                   "franchises": "THE IDOLM@STER", "composer": "C"})
+        junk = os.path.join(d, "junk.flac")
+        _mk(junk, {"artist": "ewqwe", "title": "junkjunk", "album": "junkAL",
+                   "products": "ONLY-ON-JUNK"})
+        meta = [MetadataExtractor.extract(p) for p in (good, junk)]
+        MetadataPropagator.propagate(meta)
+        jf = FLAC(junk)
+        # junk の悪メタは良メタに統一
+        assert jf["artist"][0] == "天海春香"
+        assert jf["title"][0] == "ムーンライト伝説"
+        assert jf["composer"][0] == "C"
+        assert jf["franchises"][0] == "THE IDOLM@STER"
+        # junk にしか無かった products は和集合で保持され、good 側にも行き渡る
+        gf = FLAC(good)
+        assert jf["products"][0] == "ONLY-ON-JUNK"
+        assert gf["products"][0] == "ONLY-ON-JUNK"
+
+
+def test_multivalue_tag_preserved():
+    """多値タグは先頭値に潰さず全値を保持・統一する。"""
+    from DSRE import MetadataPropagator, MetadataExtractor
+    from mutagen.flac import FLAC
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.flac")
+        _mk(a, {"artist": "X", "album": "AL", "title": "T"})
+        FLAC(a)  # ensure exists
+        af = FLAC(a); af["genre"] = ["J-Pop", "Anime"]; af.save()
+        b = os.path.join(d, "b.flac")
+        _mk(b, {"artist": "Y"})
+        meta = [MetadataExtractor.extract(p) for p in (a, b)]
+        MetadataPropagator.propagate(meta)
+        bf = FLAC(b)
+        assert list(bf["genre"]) == ["J-Pop", "Anime"]
 
 
 def test_version_tags_never_propagated():
