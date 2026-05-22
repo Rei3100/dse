@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r123"
+_DSRE_VERSION = "r124"
 
 
 # ===== DSP パラメータ =====
@@ -820,6 +820,55 @@ class FingerprintEngine:
                 (ch, duration, fp, path, datetime.datetime.utcnow().isoformat()),
             )
         return FingerprintResult(duration, fp, ch)
+
+
+# ===== chromaprint fingerprint similarity (pure Python) =====
+
+def _decode_chromaprint(fp_str: str) -> list:
+    """chromaprint base64 URL-safe エンコード文字列を int32 list に decode。
+    ヘッダ (4 byte) を skip し残りを int32 LE で読む。
+    """
+    import base64
+    try:
+        raw = base64.urlsafe_b64decode(fp_str + "=" * (4 - len(fp_str) % 4))
+    except Exception:
+        return []
+    if len(raw) < 4:
+        return []
+    body = raw[4:]
+    n = len(body) // 4
+    out = []
+    for i in range(n):
+        v = int.from_bytes(body[i*4:(i+1)*4], "little", signed=False)
+        out.append(v)
+    return out
+
+
+def fingerprint_similarity(fp_a: str, fp_b: str) -> float:
+    """chromaprint 指紋同士の Hamming 一致率 (0.0-1.0)。
+
+    best-alignment: 短い方を長い方に沿ってスライドさせ、
+    オーバーラップ部分の bit 一致率の最大値を返す。
+    """
+    a = _decode_chromaprint(fp_a)
+    b = _decode_chromaprint(fp_b)
+    if not a or not b:
+        return 0.0
+    if len(a) > len(b):
+        a, b = b, a  # a を短い方に
+    la, lb = len(a), len(b)
+    max_ratio = 0.0
+    for off in range(lb - la + 1):
+        match_bits = 0
+        total_bits = la * 32
+        for i in range(la):
+            xor = a[i] ^ b[off + i]
+            match_bits += 32 - xor.bit_count()
+        ratio = match_bits / total_bits
+        if ratio > max_ratio:
+            max_ratio = ratio
+    return max_ratio
+
 
 
 
