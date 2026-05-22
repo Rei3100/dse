@@ -43,7 +43,10 @@ a = Analysis(
     ['DSRE.py'],
     pathex=[],
     binaries=binaries,
-    datas=datas + [('logo.ico', '.')],
+    datas=datas + [
+        ('logo.ico', '.'),
+        ('_internal/ffmpeg/fpcalc.exe', 'ffmpeg'),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],

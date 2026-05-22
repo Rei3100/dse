@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r121"
+_DSRE_VERSION = "r122"
 
 
 # ===== DSP パラメータ =====
@@ -721,6 +721,20 @@ def add_ffmpeg_to_path() -> None:
     )
     if bundled:
         os.environ["PATH"] = os.path.dirname(bundled) + os.pathsep + os.environ.get("PATH", "")
+
+# ===== fpcalc.exe パス解決 (chromaprint 音声指紋) =====
+def _resolve_fpcalc_path() -> "str | None":
+    """fpcalc.exe のパスを解決。バンドル → PATH → None の優先順。
+    None 戻りで指紋機能は無効化 (graceful degrade)。"""
+    found = _find_bundled(
+        os.path.join("ffmpeg", "fpcalc.exe"),
+        os.path.join("_internal", "ffmpeg", "fpcalc.exe"),
+        "fpcalc.exe",
+    )
+    if found:
+        return found
+    from shutil import which
+    return which("fpcalc") or which("fpcalc.exe") or None
 
 
 # ===== アプリアイコン (logo.ico) =====
