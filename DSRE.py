@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r133"
+_DSRE_VERSION = "r134"
 
 
 # ===== DSP パラメータ =====
@@ -2870,6 +2870,7 @@ class Worker(QtCore.QThread):
             return "ok"
 
         # ---- STAGE 1: scan -> fingerprint -> cluster -> select -> relocate ----
+        orch = None
         if os.environ.get("DSRE_WORKFLOW", "1") == "1":
             orch = WorkflowOrchestrator(
                 input_dir=INPUT_DIR,
@@ -2992,7 +2993,7 @@ class Worker(QtCore.QThread):
             self.sig_text.emit(f"完了  {succeeded}/{total}")
 
         # ---- STAGE 3: sort OUTPUT_DIR into foobar layout ----
-        if os.environ.get("DSRE_WORKFLOW", "1") == "1" and not self._abort:
+        if orch is not None and not self._abort:
             try:
                 from mutagen.flac import FLAC as _FLAC3
                 processed = []
