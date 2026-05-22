@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r138"
+_DSRE_VERSION = "r139"
 
 
 # ===== DSP パラメータ =====
@@ -3252,7 +3252,6 @@ class MainWindow(QtWidgets.QWidget):
         self.worker.sig_step.connect(self.pb_file.setValue)
         self.worker.sig_all.connect(self.pb_all.setValue)
         self.worker.sig_text.connect(self.label.setText)
-        self.worker.finished.connect(self.metrics_tab.refresh)
         self.worker.start()
 
     def pause(self):
