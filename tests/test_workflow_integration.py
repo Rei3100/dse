@@ -32,6 +32,42 @@ def test_idempotency_skip_already_processed():
         assert a not in pending
 
 
+def test_scan_pending_excludes_output_subtree():
+    '''OUTPUT_DIR が INPUT_DIR 配下の時、その全サブツリーを scan_pending が除外する。
+    (実環境 C:\\Audio\\DSRE\\Output が C:\\Audio\\DSRE 配下にあり、処理済み出力を
+    入力として拾うと全ライブラリを再編成してしまう回帰の防止)。'''
+    from DSRE import WorkflowOrchestrator
+    with tempfile.TemporaryDirectory() as d:
+        out_dir = os.path.join(d, 'Output')
+        os.makedirs(out_dir)
+        new1 = os.path.join(d, 'new1.flac')
+        _mk_flac(new1, tags={'artist': 'X'})
+        # 処理済み出力 (タグ無し) を OUTPUT_DIR に置く
+        done = os.path.join(out_dir, 'done.flac')
+        _mk_flac(done, freq=600.0, tags={'artist': 'Y'})
+        orch = WorkflowOrchestrator(input_dir=d, output_dir=out_dir)
+        pending = orch.scan_pending()
+        assert new1 in pending
+        assert done not in pending
+
+
+def test_filter_candidates_drops_output_and_tagged():
+    '''_filter_candidates は OUTPUT_DIR 配下と dsre_version タグ持ちを落とす。'''
+    from DSRE import WorkflowOrchestrator
+    with tempfile.TemporaryDirectory() as d:
+        out_dir = os.path.join(d, 'Output')
+        os.makedirs(out_dir)
+        keep = os.path.join(d, 'keep.flac')
+        _mk_flac(keep, tags={'artist': 'X'})
+        tagged = os.path.join(d, 'tagged.flac')
+        _mk_flac(tagged, freq=500.0, tags={'artist': 'X', 'dsre_version': 'r99'})
+        in_output = os.path.join(out_dir, 'out.flac')
+        _mk_flac(in_output, freq=600.0)
+        orch = WorkflowOrchestrator(input_dir=d, output_dir=out_dir)
+        res = orch._filter_candidates([keep, tagged, in_output])
+        assert res == [keep]
+
+
 def test_resolve_multi_disc_album():
     '''album 内の disc 値で multi-disc 判定。'''
     from DSRE import WorkflowOrchestrator

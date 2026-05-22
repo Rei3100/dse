@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r135"
+_DSRE_VERSION = "r136"
 
 
 # ===== DSP パラメータ =====
@@ -1401,11 +1401,31 @@ class WorkflowOrchestrator:
         self.abort_cb = abort_cb or (lambda: False)
         self.fp_engine = FingerprintEngine(db_path=self.db_path)
 
+    def _is_under_output(self, path: str) -> bool:
+        """path が OUTPUT_DIR サブツリー内かを大文字小文字無視で判定。"""
+        try:
+            pn = os.path.normcase(os.path.abspath(path))
+            on = os.path.normcase(os.path.abspath(self.output_dir))
+        except Exception:
+            return False
+        return pn == on or pn.startswith(on + os.sep)
+
     def scan_pending(self) -> list:
-        """INPUT_DIR を再帰スキャンして dsre_version 未持ちの flac path list を返す。"""
+        """INPUT_DIR を再帰スキャンして dsre_version 未持ちの flac path list を返す。
+        OUTPUT_DIR は INPUT_DIR 配下にあるため、その全サブツリーを常に枝刈りする
+        (処理済み出力を入力として拾うと全ライブラリを再編成してしまう)。"""
         from mutagen.flac import FLAC
         out = []
-        for root, _, files in os.walk(self.input_dir):
+        on = os.path.normcase(os.path.abspath(self.output_dir))
+        in_norm = os.path.normcase(os.path.abspath(self.input_dir))
+        # output_dir が input_dir の真サブツリーの時のみ枝刈り。両者同一の
+        # 退化ケース (テスト等) では枝刈りせず dsre_version タグだけで濾す。
+        prune = (on != in_norm)
+        for root, dirs, files in os.walk(self.input_dir):
+            rn = os.path.normcase(os.path.abspath(root))
+            if prune and (rn == on or rn.startswith(on + os.sep)):
+                dirs[:] = []  # OUTPUT_DIR 配下は降りない
+                continue
             for fn in files:
                 if not fn.lower().endswith(".flac"):
                     continue
@@ -1418,6 +1438,25 @@ class WorkflowOrchestrator:
                     pass
                 out.append(p)
         return out
+
+    def _filter_candidates(self, candidates: list) -> list:
+        """GUI 選択 file list を入力候補として濾す。OUTPUT_DIR 配下と
+        dsre_version 既処理タグ持ちを除外する (再処理・再編成の暴発防止)。"""
+        from mutagen.flac import FLAC
+        res = []
+        for p in candidates:
+            if not p.lower().endswith(".flac"):
+                continue
+            if self._is_under_output(p):
+                continue
+            try:
+                f = FLAC(p)
+                if f.tags and "dsre_version" in f.tags:
+                    continue
+            except Exception:
+                pass
+            res.append(p)
+        return res
 
     def build_clusters(self, paths: list) -> list:
         """fingerprint で paths を cluster 化。指紋不能 file は単独 cluster。"""
@@ -1508,8 +1547,13 @@ class WorkflowOrchestrator:
                 new_paths.append(b.path)
         return new_paths
 
-    def run_stage1(self) -> list:
-        paths = self.scan_pending()
+    def run_stage1(self, candidates=None) -> list:
+        # GUI が選んだ候補があればそれを source of truth とする (top-level / 非
+        # OUTPUT)。無い場合のみ自前で再帰スキャンする (CLI / テスト経路)。
+        if candidates is not None:
+            paths = self._filter_candidates(candidates)
+        else:
+            paths = self.scan_pending()
         self.progress_cb(f"[STAGE 1] スキャン {len(paths)} files")
         if not paths:
             return []
@@ -2884,7 +2928,7 @@ class Worker(QtCore.QThread):
                 abort_cb=lambda: self._abort,
             )
             try:
-                workflow_files = orch.run_stage1()
+                workflow_files = orch.run_stage1(candidates=list(self.files))
             except Exception as _e:
                 self.sig_text.emit(f"[STAGE 1] エラー: {_e}")
                 workflow_files = []
