@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r126"
+_DSRE_VERSION = "r127"
 
 
 # ===== DSP パラメータ =====
@@ -947,6 +947,82 @@ class MetadataExtractor:
         except Exception:
             out["__pictures__"] = []
         return out
+
+
+# 伝播対象外 (version 識別系 + 修飾系で版ごとに変動するもの)
+_VERSION_TAGS = frozenset([
+    "version_info", "cover_type", "live_type", "vocal_type",
+    "remaster_info", "arrange_type", "m_number",
+    "featuring", "produced",
+])
+
+# canonical 選定の加重
+_CANONICAL_WEIGHT = {
+    "artist": 2, "album": 2, "title": 2, "date": 2,
+    "discnumber": 2, "tracknumber": 2,
+}
+# 上記以外の通常タグ = 1 点
+
+
+class MetadataPropagator:
+    """cluster 内で canonical 選定 + 主要/拡張タグの伝播 + version タグ保護。"""
+
+    @staticmethod
+    def _score(meta: dict) -> tuple:
+        s = 0
+        for k in _METADATA_FIELDS:
+            if k in _VERSION_TAGS:
+                continue
+            if meta.get(k):
+                s += _CANONICAL_WEIGHT.get(k, 1)
+        # アートワーク有り +3
+        if meta.get("__pictures__"):
+            s += 3
+        try:
+            size = os.path.getsize(meta["__path__"])
+        except OSError:
+            size = 0
+        return (s, size, meta["__path__"])
+
+    @staticmethod
+    def choose_canonical(group: list) -> dict:
+        return max(group, key=MetadataPropagator._score)
+
+    @staticmethod
+    def propagate(group: list) -> None:
+        """cluster 内全 file に対し、canonical → 他 file へ in-place 伝播。"""
+        if os.environ.get("DSRE_HARMONIZE_METADATA") == "0":
+            return
+        if len(group) < 2:
+            return
+        canon = MetadataPropagator.choose_canonical(group)
+        from mutagen.flac import FLAC
+        for m in group:
+            if m["__path__"] == canon["__path__"]:
+                continue
+            try:
+                f = FLAC(m["__path__"])
+                if f.tags is None:
+                    f.add_tags()
+                changed = False
+                for k in _METADATA_FIELDS:
+                    if k in _VERSION_TAGS:
+                        continue
+                    if m.get(k):  # 伝播先既値あり → 尊重
+                        continue
+                    if canon.get(k):  # canonical が値を持つ → 伝播
+                        f[k] = [canon[k]]
+                        changed = True
+                # アートワーク伝播 (伝播先が空 + canonical に存在する場合)
+                if not m.get("__pictures__") and canon.get("__pictures__"):
+                    f.clear_pictures()
+                    for pic in canon["__pictures__"]:
+                        f.add_picture(pic)
+                    changed = True
+                if changed:
+                    f.save()
+            except Exception:
+                pass
 
 # ===== アプリアイコン (logo.ico) =====
 def _logo_path() -> str | None:
