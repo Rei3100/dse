@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r141"
+_DSRE_VERSION = "r142"
 
 
 # ===== DSP パラメータ =====
@@ -1070,6 +1070,14 @@ def _is_identity_tag(key: str) -> bool:
         return False
     return True
 
+
+def _has_jxl_picture(pictures) -> bool:
+    """pictures (list) に jxl アートワークが含まれるか。"""
+    for pic in (pictures or []):
+        if getattr(pic, "mime", "") == "image/jxl":
+            return True
+    return False
+
 # canonical 選定の加重
 _CANONICAL_WEIGHT = {
     "artist": 2, "album": 2, "title": 2, "date": 2,
@@ -1119,6 +1127,9 @@ class MetadataPropagator:
         # 統一すべき canonical の identity タグ集合 (小文字キー → 値)
         canon_ident = {k: v for k, v in canon_raw.items()
                        if v and _is_identity_tag(k)}
+        # cluster 内の jxl アートワークを 1 枚拾う (canonical 優先、無ければ任意 file)。
+        # 最終アートワークは jxl のみ。jxl 以外は統合しない (ユーザー指定)。
+        jxl_pic = MetadataPropagator._find_jxl_picture([canon] + group)
         from mutagen.flac import FLAC
         for m in group:
             if m["__path__"] == canon["__path__"]:
@@ -1128,7 +1139,6 @@ class MetadataPropagator:
                 if f.tags is None:
                     f.add_tags()
                 changed = False
-                # 既存タグの実キー (大文字小文字差を吸収するため lower→実キー対応)
                 existing = {}
                 for k in list(f.tags.keys()):
                     existing.setdefault(k.lower(), k)
@@ -1140,24 +1150,38 @@ class MetadataPropagator:
                     f[existing.get(kl, kl)] = [cv]
                     changed = True
                 # 2) target 固有の identity タグ (canonical に無い) を削除し差を消す。
-                #    版識別・per-file 技術タグは残す。
                 for kl, realk in list(existing.items()):
-                    if kl in canon_ident:
-                        continue
-                    if not _is_identity_tag(kl):
+                    if kl in canon_ident or not _is_identity_tag(kl):
                         continue
                     del f[realk]
                     changed = True
-                # 3) アートワーク統一
-                if canon.get("__pictures__") and not m.get("__pictures__"):
+                # 3) jxl アートワーク: target が jxl を持たず cluster に jxl があれば付与
+                if jxl_pic is not None and not _has_jxl_picture(m.get("__pictures__")):
                     f.clear_pictures()
-                    for pic in canon["__pictures__"]:
-                        f.add_picture(pic)
+                    f.add_picture(jxl_pic)
                     changed = True
                 if changed:
                     f.save()
             except Exception:
                 pass
+        # canonical 自身が jxl を持たず cluster の他 file に jxl がある場合、canonical
+        # にも付与する (最良が canonical でアートワーク無し、を防ぐ)。
+        if jxl_pic is not None and not _has_jxl_picture(canon.get("__pictures__")):
+            try:
+                cf = FLAC(canon["__path__"])
+                cf.clear_pictures()
+                cf.add_picture(jxl_pic)
+                cf.save()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _find_jxl_picture(metas: list):
+        for m in metas:
+            for pic in (m.get("__pictures__") or []):
+                if getattr(pic, "mime", "") == "image/jxl":
+                    return pic
+        return None
 
 
 
@@ -1371,6 +1395,7 @@ class DiscardHandler:
         if not dry_run:
             try:
                 send2trash(new_path)
+                _prune_empty_dirs(d)  # 破棄で空になった元フォルダを掃除
             except Exception:
                 pass
         return new_path
@@ -1521,6 +1546,31 @@ def _resolve_collision(target: str, src: str) -> str:
     while os.path.exists(f"{base}_{n}{ext}"):
         n += 1
     return f"{base}_{n}{ext}"
+
+
+def _prune_empty_dirs(start_dir: str, boundary: str = None) -> None:
+    """start_dir から上方向に空ディレクトリを削除する。処理前音源が移動/破棄で
+    消えた後、空になった関連フォルダが溜まらないようにする。
+    boundary (既定 INPUT_DIR) と OUTPUT_DIR は絶対に削除しない。"""
+    boundary = boundary or INPUT_DIR
+    try:
+        bn = os.path.normcase(os.path.abspath(boundary))
+        on = os.path.normcase(os.path.abspath(OUTPUT_DIR))
+        cur = os.path.abspath(start_dir)
+    except Exception:
+        return
+    while True:
+        cn = os.path.normcase(cur)
+        # boundary 自身・その外・OUTPUT_DIR は触らない
+        if cn == bn or cn == on or not cn.startswith(bn + os.sep):
+            break
+        try:
+            if os.listdir(cur):  # 空でなければ停止
+                break
+            os.rmdir(cur)
+        except OSError:
+            break
+        cur = os.path.dirname(cur)
 
 
 class WorkflowOrchestrator:
@@ -1678,7 +1728,9 @@ class WorkflowOrchestrator:
             try:
                 os.makedirs(os.path.dirname(new_path), exist_ok=True)
                 if new_path != b.path:
+                    old_dir = os.path.dirname(b.path)
                     os.rename(b.path, new_path)
+                    _prune_empty_dirs(old_dir)  # 移動で空になった元フォルダを掃除
                 new_paths.append(new_path)
             except OSError:
                 new_paths.append(b.path)
@@ -3064,6 +3116,7 @@ class Worker(QtCore.QThread):
             # 出力が確定し検証も通った後、ここで初めて元ファイルを trash
             try:
                 send2trash(path)
+                _prune_empty_dirs(os.path.dirname(path))  # 空になった元フォルダ掃除
             except Exception as e:
                 _log_failure(path, "trash_fail", e)
                 return "trash_fail"

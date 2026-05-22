@@ -7,7 +7,7 @@ SR = 96000
 _FAKE_JXL = b"\xff\x0a\x00\x00\x00\x00\x00\x00"
 
 
-def _mk(path, tags, with_artwork=False):
+def _mk(path, tags, with_artwork=False, art_mime="image/jxl"):
     t = np.linspace(0, 1.0, SR, endpoint=False)
     audio = (np.sin(2 * np.pi * 440 * t) * 0.3).astype(np.float32)
     sf.write(path, audio, SR, subtype="PCM_24", format="FLAC")
@@ -16,9 +16,43 @@ def _mk(path, tags, with_artwork=False):
     for k, v in tags.items():
         f[k] = [v]
     if with_artwork:
-        pic = Picture(); pic.type = 3; pic.mime = "image/jxl"; pic.data = _FAKE_JXL
+        pic = Picture(); pic.type = 3; pic.mime = art_mime; pic.data = _FAKE_JXL
         f.add_picture(pic)
     f.save()
+
+
+def test_jxl_artwork_given_to_artless_canonical():
+    """canonical (=最良候補) が jxl を持たず、別 file に jxl がある場合、
+    canonical にも jxl が付与される (最良がアートワーク無しを防ぐ)。"""
+    from DSRE import MetadataPropagator, MetadataExtractor
+    from mutagen.flac import FLAC
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.flac")  # 完備メタ・アートワーク無し → canonical
+        _mk(a, {"artist": "X", "album": "AL", "title": "T", "genre": "G"})
+        b = os.path.join(d, "b.flac")  # 低メタ・jxl 有り
+        _mk(b, {"artist": "Y"}, with_artwork=True, art_mime="image/jxl")
+        meta = [MetadataExtractor.extract(p) for p in (a, b)]
+        assert MetadataPropagator.choose_canonical(meta)["__path__"] == a
+        MetadataPropagator.propagate(meta)
+        af = FLAC(a)
+        assert len(af.pictures) == 1
+        assert af.pictures[0].mime == "image/jxl"
+
+
+def test_non_jxl_artwork_not_unified():
+    """jxl 以外のアートワークは統合しない。"""
+    from DSRE import MetadataPropagator, MetadataExtractor
+    from mutagen.flac import FLAC
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.flac")  # 完備メタ・png アートワーク → canonical
+        _mk(a, {"artist": "X", "album": "AL", "title": "T", "genre": "G"},
+            with_artwork=True, art_mime="image/png")
+        b = os.path.join(d, "b.flac")  # 低メタ・アートワーク無し
+        _mk(b, {"artist": "Y"})
+        meta = [MetadataExtractor.extract(p) for p in (a, b)]
+        MetadataPropagator.propagate(meta)
+        bf = FLAC(b)
+        assert len(bf.pictures) == 0  # png は伝播されない
 
 
 def test_canonical_selection_by_tag_richness():
