@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r131"
+_DSRE_VERSION = "r132"
 
 
 # ===== DSP パラメータ =====
@@ -1360,6 +1360,192 @@ class FoobarPathBuilder:
             path = "\\?\\" + path
         return path
 
+
+def _resolve_collision(target: str, src: str) -> str:
+    """target が存在する場合、内容一致なら同パス、相違なら _N suffix を付与。"""
+    if not os.path.exists(target):
+        return target
+    if os.path.exists(src):
+        try:
+            from hashlib import md5
+            def _fh(p):
+                h = md5()
+                with open(p, "rb") as fh:
+                    while True:
+                        chunk = fh.read(64 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                return h.hexdigest()
+            if _fh(target) == _fh(src):
+                return target
+        except OSError:
+            pass
+    base, ext = os.path.splitext(target)
+    n = 2
+    while os.path.exists(f"{base}_{n}{ext}"):
+        n += 1
+    return f"{base}_{n}{ext}"
+
+
+class WorkflowOrchestrator:
+    """STAGE 1-3 統括: スキャン -> 指紋 -> クラスタ -> 伝播 -> 採点 -> 選択 -> 破棄 -> 仕分け。"""
+
+    def __init__(self, input_dir: str, output_dir: str,
+                 db_path: str = None,
+                 progress_cb=None, abort_cb=None):
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.db_path = db_path or METRICS_DB_PATH
+        self.progress_cb = progress_cb or (lambda s: None)
+        self.abort_cb = abort_cb or (lambda: False)
+        self.fp_engine = FingerprintEngine(db_path=self.db_path)
+
+    def scan_pending(self) -> list:
+        """INPUT_DIR を再帰スキャンして dsre_version 未持ちの flac path list を返す。"""
+        from mutagen.flac import FLAC
+        out = []
+        for root, _, files in os.walk(self.input_dir):
+            for fn in files:
+                if not fn.lower().endswith(".flac"):
+                    continue
+                p = os.path.join(root, fn)
+                try:
+                    f = FLAC(p)
+                    if f.tags and "dsre_version" in f.tags:
+                        continue
+                except Exception:
+                    pass
+                out.append(p)
+        return out
+
+    def build_clusters(self, paths: list) -> list:
+        """fingerprint で paths を cluster 化。指紋不能 file は単独 cluster。"""
+        threshold = float(os.environ.get("DSRE_CLUSTER_SIMILARITY", "0.85"))
+        fp_map = {}
+        for i, p in enumerate(paths, 1):
+            self.progress_cb(f"[STAGE 1] Fingerprinting {i}/{len(paths)}")
+            if self.abort_cb():
+                return [[p] for p in paths]
+            r = self.fp_engine.compute(p)
+            if r is not None:
+                fp_map[p] = r.fingerprint
+
+        cb = ClusterBuilder(similarity_threshold=threshold)
+        with_fp = list(fp_map.keys())
+        for i in range(len(with_fp)):
+            for j in range(i + 1, len(with_fp)):
+                if self.abort_cb():
+                    break
+                sim = fingerprint_similarity(fp_map[with_fp[i]], fp_map[with_fp[j]])
+                cb.add_pair(with_fp[i], with_fp[j], sim)
+        return cb.build(items=paths)
+
+    def harmonize_metadata(self, cluster: list) -> list:
+        meta = [MetadataExtractor.extract(p) for p in cluster]
+        MetadataPropagator.propagate(meta)
+        meta = [MetadataExtractor.extract(p) for p in cluster]
+        return meta
+
+    def score_files(self, meta_list: list) -> list:
+        out = []
+        for m in meta_list:
+            if self.abort_cb():
+                break
+            r = QualityProbe.score(m["__path__"])
+            if r is None:
+                continue
+            sz = os.path.getsize(m["__path__"])
+            out.append((m["__path__"], r, sz))
+        return out
+
+    def process_subcluster(self, sub: list):
+        scored = self.score_files(sub)
+        if not scored:
+            return None
+        best = BestSelector.choose(scored)
+        for path, sr, sz in scored:
+            if path == best.path:
+                continue
+            try:
+                DiscardHandler.discard(path)
+            except Exception:
+                pass
+        return best
+
+    @staticmethod
+    def _is_multi_disc(meta_list: list, album: str) -> bool:
+        if not album:
+            return False
+        discs = set()
+        for m in meta_list:
+            if m.get("album") == album:
+                d = m.get("discnumber", "1") or "1"
+                discs.add(d)
+        non_one = {d for d in discs if d not in ("1", "01", "")}
+        if non_one:
+            return True
+        return os.environ.get("DSRE_DISC_DIR_ALWAYS") == "1"
+
+    def relocate_best_files(self, bests: list, all_meta: list) -> list:
+        new_paths = []
+        for b in bests:
+            m = MetadataExtractor.extract(b.path)
+            multi = self._is_multi_disc(all_meta, m.get("album", ""))
+            new_path = FoobarPathBuilder.build(self.input_dir, m, multi_disc=multi)
+            new_path = _resolve_collision(new_path, b.path)
+            try:
+                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                if new_path != b.path:
+                    os.rename(b.path, new_path)
+                new_paths.append(new_path)
+            except OSError:
+                new_paths.append(b.path)
+        return new_paths
+
+    def run_stage1(self) -> list:
+        paths = self.scan_pending()
+        self.progress_cb(f"[STAGE 1] スキャン {len(paths)} files")
+        if not paths:
+            return []
+        clusters = self.build_clusters(paths)
+        self.progress_cb(f"[STAGE 1] クラスタリング {len(clusters)} cluster")
+
+        all_meta = []
+        bests = []
+        for c in clusters:
+            if self.abort_cb():
+                break
+            meta = self.harmonize_metadata(c)
+            subs = split_versions(meta)
+            for sub in subs:
+                best = self.process_subcluster(sub)
+                if best:
+                    bests.append(best)
+            all_meta.extend(meta)
+
+        self.progress_cb(f"[STAGE 1] 最良選択 {len(bests)} 完了")
+        if os.environ.get("DSRE_PRESORT_INPUT") == "0":
+            return [b.path for b in bests]
+        new_paths = self.relocate_best_files(bests, all_meta)
+        self.progress_cb("[STAGE 1] 整列完了")
+        return new_paths
+
+    def run_stage3(self, processed_paths: list) -> None:
+        all_meta = [MetadataExtractor.extract(p) for p in processed_paths]
+        for p, m in zip(processed_paths, all_meta):
+            multi = self._is_multi_disc(all_meta, m.get("album", ""))
+            new_path = FoobarPathBuilder.build(self.output_dir, m, multi_disc=multi)
+            new_path = _resolve_collision(new_path, p)
+            try:
+                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                if new_path != p:
+                    os.rename(p, new_path)
+            except OSError:
+                pass
+        self.progress_cb("[STAGE 3] 整列完了")
+
+
 # ===== 安全読み込み =====
 def load_audio_safe(path):
     try:
@@ -2683,6 +2869,18 @@ class Worker(QtCore.QThread):
                 return "trash_fail"
             return "ok"
 
+        # ---- STAGE 1: scan -> fingerprint -> cluster -> select -> relocate ----
+        if os.environ.get("DSRE_WORKFLOW", "1") == "1":
+            orch = WorkflowOrchestrator(
+                input_dir=INPUT_DIR,
+                output_dir=OUTPUT_DIR,
+                progress_cb=self.sig_text.emit,
+                abort_cb=lambda: self._abort,
+            )
+            workflow_files = orch.run_stage1()
+            self.files = workflow_files
+            total = len(self.files)
+
         pending = list(self.files)
         max_cpus = max(1, os.cpu_count() or 1)
         in_flight: list = []  # (Future, path)
@@ -2792,6 +2990,26 @@ class Worker(QtCore.QThread):
             self.sig_text.emit(f"完了  成功{succeeded}/{total}{tail}")
         else:
             self.sig_text.emit(f"完了  {succeeded}/{total}")
+
+        # ---- STAGE 3: sort OUTPUT_DIR into foobar layout ----
+        if os.environ.get("DSRE_WORKFLOW", "1") == "1" and not self._abort:
+            try:
+                from mutagen.flac import FLAC as _FLAC3
+                processed = []
+                if os.path.isdir(OUTPUT_DIR):
+                    for fn in os.listdir(OUTPUT_DIR):
+                        p3 = os.path.join(OUTPUT_DIR, fn)
+                        if not p3.lower().endswith(".flac"):
+                            continue
+                        try:
+                            tf = _FLAC3(p3)
+                            if tf.tags and "dsre_version" in tf.tags:
+                                processed.append(p3)
+                        except Exception:
+                            pass
+                orch.run_stage3(processed)
+            except Exception:
+                pass
 
 
 # ===== UI (v1.4: トレイ常駐 + 負荷サブメニュー + logo.ico + × 即終了) =====
