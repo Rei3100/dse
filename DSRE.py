@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r125"
+_DSRE_VERSION = "r126"
 
 
 # ===== DSP パラメータ =====
@@ -908,6 +908,45 @@ class ClusterBuilder:
             groups.setdefault(root, []).append(it)
         return list(groups.values())
 
+
+# ===== Vorbis Comment タグ抽出 =====
+# 既存の Vorbis Comment 抽出対象タグ (foobar 階層と一致)
+_METADATA_FIELDS = [
+    # 主要 (採点・整列で使用)
+    "artist", "album", "title", "discnumber", "tracknumber",
+    "date", "genre",
+    # カテゴリ階層
+    "age", "circle", "category", "source", "grouping",
+    # 作品識別
+    "franchises", "products", "series", "brand", "subtitle", "elements",
+    # プロジェクト
+    "project", "collaboration", "group", "unit", "album_type",
+    # 修飾サフィックス
+    "featuring", "produced", "arrange_type",
+    "version_info", "remaster_info", "cover_type", "live_type",
+    "vocal_type", "m_number",
+]
+
+
+class MetadataExtractor:
+    """mutagen で FLAC の Vorbis Comment タグを抽出する純粋クラス。"""
+
+    @staticmethod
+    def extract(path: str) -> dict:
+        """戻り値: {field: value or ""} の dict。欠落は空文字。"""
+        from mutagen.flac import FLAC
+        out = {k: "" for k in _METADATA_FIELDS}
+        out["__path__"] = path
+        try:
+            f = FLAC(path)
+            for key in _METADATA_FIELDS:
+                vals = f.tags.get(key) if f.tags else None
+                if vals:
+                    out[key] = str(vals[0])
+            out["__pictures__"] = list(f.pictures)
+        except Exception:
+            out["__pictures__"] = []
+        return out
 
 # ===== アプリアイコン (logo.ico) =====
 def _logo_path() -> str | None:
