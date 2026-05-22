@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r124"
+_DSRE_VERSION = "r125"
 
 
 # ===== DSP パラメータ =====
@@ -870,6 +870,43 @@ def fingerprint_similarity(fp_a: str, fp_b: str) -> float:
     return max_ratio
 
 
+
+
+class ClusterBuilder:
+    """指紋類似度ペアを union-find で cluster 化する。"""
+
+    def __init__(self, similarity_threshold: float = 0.85):
+        self.threshold = similarity_threshold
+        self._parent: dict = {}
+        self._pairs: list = []
+
+    def _find(self, x):
+        while self._parent.get(x, x) != x:
+            self._parent[x] = self._parent.get(self._parent[x], self._parent[x])
+            x = self._parent[x]
+        return x
+
+    def _union(self, x, y):
+        rx, ry = self._find(x), self._find(y)
+        if rx != ry:
+            self._parent[rx] = ry
+
+    def add_pair(self, a, b, similarity: float) -> None:
+        self._pairs.append((a, b, similarity))
+        if similarity >= self.threshold:
+            self._parent.setdefault(a, a)
+            self._parent.setdefault(b, b)
+            self._union(a, b)
+
+    def build(self, items: list) -> list:
+        """全 item を root でグルーピングして cluster の list を返す。"""
+        for it in items:
+            self._parent.setdefault(it, it)
+        groups: dict = {}
+        for it in items:
+            root = self._find(it)
+            groups.setdefault(root, []).append(it)
+        return list(groups.values())
 
 
 # ===== アプリアイコン (logo.ico) =====
