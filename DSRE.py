@@ -9,6 +9,7 @@ import configparser
 import functools
 import threading
 import datetime
+import json
 import shutil
 import traceback as _traceback
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r144"
+_DSRE_VERSION = "r145"
 
 
 # ===== DSP パラメータ =====
@@ -1641,6 +1642,114 @@ def _scan_pending_files(input_dir: str, output_dir: str) -> list:
     return out
 
 
+def _predict_output_path(meta: dict) -> str:
+    """meta から per-file 仕分け後の出力パスを予測する (_sort_output_into_foobar と同一規則)。"""
+    disc = (meta.get("discnumber") or "1")
+    multi = (disc not in ("1", "01", "")
+             or os.environ.get("DSRE_DISC_DIR_ALWAYS") == "1")
+    return FoobarPathBuilder.build(OUTPUT_DIR, meta, multi_disc=multi)
+
+
+class ProcessedRegistry:
+    """セッション跨ぎ同曲 dedup 用の永続レジストリ。処理済み各曲の chroma /
+    音質 score / 実出力パス / 統合 identity メタを保持し、後日同曲が来たら比較する。
+    出力が消えた (手動削除/中断) エントリは find 時に self-heal で除去する。"""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS processed_songs (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    n_frames    INTEGER NOT NULL,
+                    chroma      BLOB NOT NULL,
+                    quality     REAL NOT NULL,
+                    output_path TEXT NOT NULL,
+                    meta_json   TEXT,
+                    dsre_version TEXT,
+                    ts          TEXT
+                )
+            """)
+
+    def find_match(self, chroma, threshold: float):
+        """chroma に同曲一致する最良エントリ (id, quality, output_path, meta_json) を返す。
+        無ければ None。出力消失エントリは除去する。"""
+        if chroma is None:
+            return None
+        with sqlite3.connect(self.db_path) as c:
+            rows = c.execute(
+                "SELECT id, n_frames, chroma, quality, output_path, meta_json "
+                "FROM processed_songs").fetchall()
+        best = None
+        best_sim = threshold
+        stale = []
+        for rid, nf, blob, q, outp, mj in rows:
+            if not outp or not os.path.exists(outp):
+                stale.append(rid)
+                continue
+            try:
+                arr = np.frombuffer(blob, dtype=np.float16).astype(np.float32).reshape(12, nf)
+            except Exception:
+                stale.append(rid)
+                continue
+            sim = chroma_similarity(chroma, arr)
+            if sim >= best_sim:
+                best_sim = sim
+                best = (rid, q, outp, mj)
+        if stale:
+            try:
+                with sqlite3.connect(self.db_path) as c:
+                    c.executemany("DELETE FROM processed_songs WHERE id = ?",
+                                  [(s,) for s in stale])
+            except Exception:
+                pass
+        return best
+
+    def record(self, chroma, quality: float, output_path: str, meta_json: str) -> None:
+        if chroma is None:
+            return
+        try:
+            with sqlite3.connect(self.db_path) as c:
+                c.execute(
+                    "INSERT INTO processed_songs "
+                    "(n_frames, chroma, quality, output_path, meta_json, dsre_version, ts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (chroma.shape[1], chroma.astype(np.float16).tobytes(),
+                     float(quality), output_path, meta_json, _DSRE_VERSION,
+                     datetime.datetime.utcnow().isoformat()),
+                )
+        except Exception:
+            pass
+
+    def remove(self, rid: int) -> None:
+        try:
+            with sqlite3.connect(self.db_path) as c:
+                c.execute("DELETE FROM processed_songs WHERE id = ?", (rid,))
+        except Exception:
+            pass
+
+
+def _fill_missing_identity(target_path: str, new_meta: dict) -> None:
+    """既存出力 (後日も維持する側) に、後日分が持つ identity タグのうち既存に
+    無いものだけ補完する (既存値は尊重、コピー手間ゼロ化)。"""
+    try:
+        from mutagen.flac import FLAC
+        f = FLAC(target_path)
+        if f.tags is None:
+            f.add_tags()
+        existing = {k.lower() for k in f.tags.keys()}
+        changed = False
+        for kl, vals in (new_meta.get("__rawtags__") or {}).items():
+            if not vals or not _is_identity_tag(kl) or kl in existing:
+                continue
+            f[kl] = list(vals)
+            changed = True
+        if changed:
+            f.save()
+    except Exception:
+        pass
+
+
 class WorkflowOrchestrator:
     """STAGE 1-3 統括: スキャン -> 指紋 -> クラスタ -> 伝播 -> 採点 -> 選択 -> 破棄 -> 仕分け。"""
 
@@ -1653,6 +1762,9 @@ class WorkflowOrchestrator:
         self.progress_cb = progress_cb or (lambda s: None)
         self.abort_cb = abort_cb or (lambda: False)
         self.fp_engine = FingerprintEngine(db_path=self.db_path)
+        self.registry = ProcessedRegistry(self.db_path)
+        # {正規化出力前パス: (chroma, quality, identity_json)} — 処理完了後に登録する
+        self._pending_reg = {}
 
     def _is_under_output(self, path: str) -> bool:
         """path が OUTPUT_DIR サブツリー内かを大文字小文字無視で判定。"""
@@ -1805,9 +1917,57 @@ class WorkflowOrchestrator:
             all_meta.extend(meta)
 
         self.progress_cb(f"[STAGE 1] 最良選択 {len(bests)} 完了")
+
+        # ---- セッション跨ぎ同曲 dedup (後日パターン) ----
+        # 既処理レジストリと照合し、既存が同等以上なら後日分を破棄+既存にメタ補完、
+        # 後日分が高品質なら旧出力を破棄して置換。登録は処理完了後 (実出力パス) に行う。
+        survivors = bests  # (cross-session OFF 時はそのまま)
+        reg_info = {}      # id(best) -> (chroma, quality, identity_json)
+        if os.environ.get("DSRE_CROSS_SESSION", "1") == "1":
+            threshold = float(os.environ.get("DSRE_CLUSTER_SIMILARITY", "0.42"))
+            survivors = []
+            for best in bests:
+                chroma = self.fp_engine.compute_chroma(best.path)
+                quality = best.score_result.score if best.score_result else None
+                meta = MetadataExtractor.extract(best.path)
+                identity = {k: v for k, v in (meta.get("__rawtags__") or {}).items()
+                            if _is_identity_tag(k)}
+                ij = json.dumps(identity, ensure_ascii=False)
+                match = (self.registry.find_match(chroma, threshold)
+                         if (chroma is not None and quality is not None) else None)
+                if match:
+                    rid, mq, mout, _mj = match
+                    if mq >= quality:
+                        # 既存が同等以上 → 後日分破棄、既存出力に後日分の不足メタを補完
+                        self.progress_cb(f"[STAGE 1] 既処理同曲あり・既存維持: {os.path.basename(best.path)[:28]}")
+                        _fill_missing_identity(mout, meta)
+                        try:
+                            DiscardHandler.discard(best.path)
+                        except Exception:
+                            pass
+                        continue
+                    else:
+                        # 後日分が高品質 → 旧出力をゴミ箱、レジストリ除去して置換
+                        self.progress_cb(f"[STAGE 1] 既処理より高品質・旧出力置換: {os.path.basename(best.path)[:24]}")
+                        try:
+                            send2trash(mout)
+                            _prune_empty_dirs(os.path.dirname(mout), OUTPUT_DIR)
+                        except Exception:
+                            pass
+                        self.registry.remove(rid)
+                survivors.append(best)
+                reg_info[id(best)] = (chroma, quality, ij)
+
         if os.environ.get("DSRE_PRESORT_INPUT") == "0":
-            return [b.path for b in bests]
-        new_paths = self.relocate_best_files(bests, all_meta)
+            return [b.path for b in survivors]
+        new_paths = self.relocate_best_files(survivors, all_meta)
+        # relocate 後の実パス → 登録情報を紐付け (処理完了後に registry.record する)
+        self._pending_reg = {}
+        for best, np_ in zip(survivors, new_paths):
+            info = reg_info.get(id(best))
+            if info and info[0] is not None and info[1] is not None:
+                key = os.path.normcase(os.path.abspath(np_))
+                self._pending_reg[key] = info
         self.progress_cb("[STAGE 1] 整列完了")
         return new_paths
 
@@ -3141,7 +3301,15 @@ class Worker(QtCore.QThread):
             _embed_output_metadata(out, pictures)
             # per-file 仕分け: 出力した直後に foobar 階層へ移す (途中終了対策)。
             if orch is not None:
+                reg = orch._pending_reg.pop(
+                    os.path.normcase(os.path.abspath(path)), None)
                 out = _sort_output_into_foobar(out)
+                # セッション跨ぎレジストリに実出力パスで登録 (後日同曲比較用)
+                if reg is not None:
+                    try:
+                        orch.registry.record(reg[0], reg[1], out, reg[2])
+                    except Exception:
+                        pass
             _check_abort()
 
             try:
