@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r129"
+_DSRE_VERSION = "r130"
 
 
 # ===== DSP パラメータ =====
@@ -1198,6 +1198,167 @@ class QualityProbe:
 
         return score, len(reasons) > 0, reasons
 
+
+
+class BestSelection:
+    __slots__ = ('path', 'score_result', 'warn_all_flagged')
+    def __init__(self, path, score_result, warn):
+        self.path = path
+        self.score_result = score_result
+        self.warn_all_flagged = warn
+
+
+class BestSelector:
+    """sub-cluster 内で最良 file を選ぶ。"""
+
+    @staticmethod
+    def choose(items: list) -> BestSelection:
+        """items: list of (path, ScoreResult, file_size)。"""
+        clean = [it for it in items if not it[1].flagged]
+        pool = clean or items
+        best = max(pool, key=lambda it: (it[1].score, it[2], it[0]))
+        return BestSelection(best[0], best[1], warn=(len(clean) == 0))
+
+
+class DiscardHandler:
+    """非最良 file を識別可能リネーム → ゴミ筱投入。"""
+
+    PREFIX = '[DSRE-inferior] '
+
+    @staticmethod
+    def discard(path: str, dry_run: bool = False) -> str:
+        """path をリネームし、dry_run=False なら send2trash で削除。
+        戻り値: リネーム後パス。"""
+        d, name = os.path.split(path)
+        new_name = DiscardHandler.PREFIX + name
+        new_path = os.path.join(d, new_name)
+        os.rename(path, new_path)
+        if not dry_run:
+            try:
+                send2trash(new_path)
+            except Exception:
+                pass
+        return new_path
+
+
+
+# ===== foobar 互換パス構築 =====
+_WIN_FORBIDDEN = {
+    "<": "＜", ">": "＞", ":": "：", '"': "”",
+    "/": "／", "\\": "￥", "|": "｜", "?": "？", "*": "＊",
+}
+
+
+class FoobarPathBuilder:
+    """foobar 互換階層パス構築 + Windows サニタイズ + 長パス対応。"""
+
+    CATEGORY_LEVELS = ["genre", "age", "circle", "category", "source", "grouping"]
+    PROJECT_LEVELS = ["project", "collaboration", "group", "unit", "album_type"]
+    MODIFIER_TAGS = [
+        ("produced", lambda v: f"Prod. {v}"),
+        ("arrange_type", lambda v: v.replace(";", " /")),
+        ("version_info", lambda v: v.replace(";", " /")),
+        ("remaster_info", lambda v: v.replace(";", " /")),
+        ("cover_type", lambda v: v),
+        ("live_type", lambda v: v),
+        ("vocal_type", lambda v: v),
+        ("m_number", lambda v: v),
+    ]
+
+    @staticmethod
+    def _sanitize_segment(s: str) -> str:
+        for k, v in _WIN_FORBIDDEN.items():
+            s = s.replace(k, v)
+        s = s.rstrip(" .")
+        return s
+
+    @staticmethod
+    def _work_identifier_levels(m: dict) -> list:
+        """親子重複排除を行った作品識別レベル順序。"""
+        out = []
+        project = m.get("project", "")
+        brand = m.get("brand", "")
+        franchises = m.get("franchises", "")
+        subtitle = m.get("subtitle", "")
+        elements = m.get("elements", "")
+
+        if franchises and franchises != project:
+            out.append(franchises)
+        products = m.get("products", "")
+        if products and products != project and products != brand:
+            out.append(products)
+        series = m.get("series", "")
+        if series and series != project:
+            out.append(series)
+        if brand:
+            out.append(brand)
+        if subtitle and subtitle != brand and subtitle != franchises:
+            out.append(subtitle)
+        if elements and elements != brand and elements != franchises and elements != subtitle:
+            out.append(elements)
+        return out
+
+    @staticmethod
+    def build(output_root: str, m: dict, multi_disc: bool) -> str:
+        parts = [output_root]
+
+        for k in FoobarPathBuilder.CATEGORY_LEVELS:
+            if m.get(k):
+                parts.append(FoobarPathBuilder._sanitize_segment(m[k]))
+
+        for w in FoobarPathBuilder._work_identifier_levels(m):
+            parts.append(FoobarPathBuilder._sanitize_segment(w))
+
+        for k in FoobarPathBuilder.PROJECT_LEVELS:
+            if m.get(k):
+                parts.append(FoobarPathBuilder._sanitize_segment(m[k]))
+
+        disc = m.get("discnumber", "1") or "1"
+        if m.get("album"):
+            album = m["album"]
+            if m.get("date"):
+                album = f"{album} ({m['date']})"
+            parts.append(FoobarPathBuilder._sanitize_segment(album))
+
+        if multi_disc:
+            try:
+                parts.append(f"Disc {int(disc):02d}")
+            except ValueError:
+                parts.append(f"Disc {disc}")
+
+        try:
+            d_pad = f"{int(disc):02d}"
+        except ValueError:
+            d_pad = disc
+        track = m.get("tracknumber", "0") or "0"
+        try:
+            t_pad = f"{int(track):03d}"
+        except ValueError:
+            t_pad = track
+
+        title = FoobarPathBuilder._sanitize_segment(m.get("title", ""))
+        artist = m.get("artist", "").replace("/", "_ ")
+        featuring = m.get("featuring", "").replace("/", "* ")
+
+        artist_part = ""
+        if featuring:
+            artist_part = f" - {FoobarPathBuilder._sanitize_segment(artist)} [feat. {FoobarPathBuilder._sanitize_segment(featuring)}]"
+        elif artist:
+            artist_part = f" - {FoobarPathBuilder._sanitize_segment(artist)}"
+
+        modifiers = ""
+        for key, fmt in FoobarPathBuilder.MODIFIER_TAGS:
+            v = m.get(key, "")
+            if v:
+                modifiers += f" [{FoobarPathBuilder._sanitize_segment(fmt(v))}]"
+
+        filename = f"{d_pad}.{t_pad}.{title}{artist_part}{modifiers}.flac"
+        parts.append(filename)
+
+        path = "\\".join(parts)
+        if len(path) > 250 and not path.startswith("\\?\\"):
+            path = "\\?\\" + path
+        return path
 
 # ===== 安全読み込み =====
 def load_audio_safe(path):
