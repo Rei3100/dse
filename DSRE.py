@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r140"
+_DSRE_VERSION = "r141"
 
 
 # ===== DSP パラメータ =====
@@ -1019,19 +1019,27 @@ class MetadataExtractor:
 
     @staticmethod
     def extract(path: str) -> dict:
-        """戻り値: {field: value or ""} の dict。欠落は空文字。"""
+        """戻り値: {field: value or ""} の dict。欠落は空文字。
+        __rawtags__ に全 Vorbis Comment (小文字キー → 先頭値) も格納する
+        (固定リストに無い composer / lyricist / 将来タグも統一対象にするため)。"""
         from mutagen.flac import FLAC
         out = {k: "" for k in _METADATA_FIELDS}
         out["__path__"] = path
+        raw = {}
         try:
             f = FLAC(path)
+            if f.tags:
+                for key in f.tags.keys():
+                    vals = f.tags.get(key)
+                    if vals:
+                        raw.setdefault(key.lower(), str(vals[0]))
             for key in _METADATA_FIELDS:
-                vals = f.tags.get(key) if f.tags else None
-                if vals:
-                    out[key] = str(vals[0])
+                if raw.get(key):
+                    out[key] = raw[key]
             out["__pictures__"] = list(f.pictures)
         except Exception:
             out["__pictures__"] = []
+        out["__rawtags__"] = raw
         return out
 
 
@@ -1041,6 +1049,26 @@ _VERSION_TAGS = frozenset([
     "remaster_info", "arrange_type", "m_number",
     "featuring", "produced",
 ])
+
+# per-file 技術タグ: その音源固有の値なので統一しない (残す側・破棄側で別々で正しい)。
+# DSRE 処理後に再計算される loudness/peak 系、エンコーダ情報、処理マーカー等。
+_TECHNICAL_TAGS = frozenset([
+    "dynamic range", "encoder", "encoded_by", "created",
+    "dsre_version", "dsre_processed_utc", "comment_dsre",
+])
+_TECHNICAL_PREFIXES = ("replaygain_", "truepeak_scanner_", "r128_")
+
+
+def _is_identity_tag(key: str) -> bool:
+    """そのタグが「曲の同一性メタデータ」か (= cluster 内で統一すべきか) を返す。
+    版識別タグ・per-file 技術タグは False (統一しない)。それ以外は全て True
+    (固定リスト非依存。未知/将来タグも既定で統一対象)。"""
+    k = key.lower()
+    if k in _VERSION_TAGS or k in _TECHNICAL_TAGS:
+        return False
+    if k.startswith(_TECHNICAL_PREFIXES):
+        return False
+    return True
 
 # canonical 選定の加重
 _CANONICAL_WEIGHT = {
@@ -1056,11 +1084,11 @@ class MetadataPropagator:
     @staticmethod
     def _score(meta: dict) -> tuple:
         s = 0
-        for k in _METADATA_FIELDS:
-            if k in _VERSION_TAGS:
+        raw = meta.get("__rawtags__", {})
+        for k, v in raw.items():
+            if not v or not _is_identity_tag(k):
                 continue
-            if meta.get(k):
-                s += _CANONICAL_WEIGHT.get(k, 1)
+            s += _CANONICAL_WEIGHT.get(k, 1)  # 主要タグは加重、その他 1 点
         # アートワーク有り +3
         if meta.get("__pictures__"):
             s += 3
@@ -1087,6 +1115,10 @@ class MetadataPropagator:
         if len(group) < 2:
             return
         canon = MetadataPropagator.choose_canonical(group)
+        canon_raw = canon.get("__rawtags__", {})
+        # 統一すべき canonical の identity タグ集合 (小文字キー → 値)
+        canon_ident = {k: v for k, v in canon_raw.items()
+                       if v and _is_identity_tag(k)}
         from mutagen.flac import FLAC
         for m in group:
             if m["__path__"] == canon["__path__"]:
@@ -1096,17 +1128,27 @@ class MetadataPropagator:
                 if f.tags is None:
                     f.add_tags()
                 changed = False
-                for k in _METADATA_FIELDS:
-                    if k in _VERSION_TAGS:
+                # 既存タグの実キー (大文字小文字差を吸収するため lower→実キー対応)
+                existing = {}
+                for k in list(f.tags.keys()):
+                    existing.setdefault(k.lower(), k)
+                # 1) canonical の identity タグを全て上書き設定
+                for kl, cv in canon_ident.items():
+                    cur = f.tags.get(existing.get(kl, kl))
+                    if cur and str(cur[0]) == cv:
                         continue
-                    cv = canon.get(k)
-                    if not cv:  # canonical が持たない項目は target をそのまま残す
-                        continue
-                    if m.get(k) == cv:  # 既に同値
-                        continue
-                    f[k] = [cv]  # canonical 値で上書き統一
+                    f[existing.get(kl, kl)] = [cv]
                     changed = True
-                # アートワーク統一 (canonical に存在し target と異なる場合)
+                # 2) target 固有の identity タグ (canonical に無い) を削除し差を消す。
+                #    版識別・per-file 技術タグは残す。
+                for kl, realk in list(existing.items()):
+                    if kl in canon_ident:
+                        continue
+                    if not _is_identity_tag(kl):
+                        continue
+                    del f[realk]
+                    changed = True
+                # 3) アートワーク統一
                 if canon.get("__pictures__") and not m.get("__pictures__"):
                     f.clear_pictures()
                     for pic in canon["__pictures__"]:

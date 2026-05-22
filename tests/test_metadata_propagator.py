@@ -82,6 +82,34 @@ def test_propagate_unifies_conflicting_value():
         assert bf["title"][0] == "T"
 
 
+def test_unify_covers_arbitrary_and_future_tags():
+    """固定リストに無いタグ (composer 等) も統一される。per-file 技術タグ
+    (replaygain_*) は各音源固有なので統一しない。"""
+    from DSRE import MetadataPropagator, MetadataExtractor
+    from mutagen.flac import FLAC
+    with tempfile.TemporaryDirectory() as d:
+        a = os.path.join(d, "a.flac")
+        _mk(a, {"artist": "X", "album": "AL", "title": "T",
+                "composer": "C", "lyricist": "LY", "customtag": "CUSTOM",
+                "replaygain_track_range": "2.68 LU"})
+        b = os.path.join(d, "b.flac")
+        _mk(b, {"artist": "Y", "description": "b-only",
+                "replaygain_track_range": "2.67 LU"})
+        meta = [MetadataExtractor.extract(p) for p in (a, b)]
+        assert MetadataPropagator.choose_canonical(meta)["__path__"] == a
+        MetadataPropagator.propagate(meta)
+        bf = FLAC(b)
+        # 固定リスト外タグも統一
+        assert bf["composer"][0] == "C"
+        assert bf["lyricist"][0] == "LY"
+        assert bf["customtag"][0] == "CUSTOM"
+        assert bf["artist"][0] == "X"
+        # canonical に無い target 固有 identity タグは削除 (差を消す)
+        assert "description" not in bf
+        # per-file 技術タグは b 自身の値を保持 (統一しない)
+        assert bf["replaygain_track_range"][0] == "2.67 LU"
+
+
 def test_version_tags_never_propagated():
     """version 識別系タグは canonical が持っていても伝播しない。"""
     from DSRE import MetadataPropagator, MetadataExtractor
