@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r146"
+_DSRE_VERSION = "r147"
 
 
 # ===== DSP パラメータ =====
@@ -780,6 +780,15 @@ class FingerprintEngine:
                     computed_at  TEXT NOT NULL
                 )
             """)
+            # ボーカル有無の音響判定用 cache (REPET foreground 比)。タグに頼らず
+            # 同曲 cluster 内で vocal / instrumental を相対ギャップで分離する。
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS vocalness (
+                    content_hash TEXT PRIMARY KEY,
+                    value        REAL NOT NULL,
+                    computed_at  TEXT NOT NULL
+                )
+            """)
 
     @staticmethod
     def _content_hash(path: str) -> str:
@@ -876,6 +885,43 @@ class FingerprintEngine:
         except Exception:
             pass
         return fixed
+
+    def compute_vocalness(self, path: str) -> "float | None":
+        """ボーカル有無の音響指標 (REPET foreground エネルギー比) を返す。cache 付き。
+        ボーカルは伴奏の上に foreground エネルギーを足すため、同曲内で vocal 版は
+        instrumental 版より高い値になる。絶対値ではなく cluster 内相対比較に使う。
+        メタデータ非依存。失敗時 None。"""
+        try:
+            ch = self._content_hash(path)
+        except OSError:
+            return None
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute("SELECT value FROM vocalness WHERE content_hash = ?",
+                            (ch,)).fetchone()
+            if row:
+                return float(row[0])
+        try:
+            import librosa
+            y, sr = librosa.load(path, sr=_CHROMA_SR, mono=True,
+                                 duration=_CHROMA_MAX_SEC)
+            if y.size < _CHROMA_SR:
+                return None
+            S = np.abs(librosa.stft(y))
+            width = max(1, int(librosa.time_to_frames(2, sr=sr, hop_length=512)))
+            Sf = librosa.decompose.nn_filter(S, aggregate=np.median,
+                                             metric="cosine", width=width)
+            Sf = np.minimum(S, Sf)
+            mask_fore = librosa.util.softmask(S - Sf, 2.0 * Sf, power=2)
+            val = float((S * mask_fore).sum() / (S.sum() + 1e-9))
+        except Exception:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as c:
+                c.execute("INSERT OR REPLACE INTO vocalness VALUES (?, ?, ?)",
+                          (ch, val, datetime.datetime.utcnow().isoformat()))
+        except Exception:
+            pass
+        return val
 
 
 # ===== chroma 同曲判定 (移調不変・時系列相関) =====
@@ -1213,14 +1259,37 @@ _SPLIT_VERSION_TAGS = ("vocal_type", "live_type", "arrange_type", "version_info"
 
 def _split_versions_for_dedup(cluster_meta: list) -> list:
     """同曲 (chroma) cluster を、視聴体験が異なる版 (インスト/オフボーカル/ライブ/
-    アレンジ) ごとに分割する。各 sub-group 内は同一視聴体験なので最良 1 個に dedup。
-    例: vocal 版 3 + instrumental 版 2 → [vocal3, instrumental2] の 2 group。"""
+    アレンジ) ごとに分割する (タグベース)。各 sub-group 内は同一視聴体験。"""
     groups: dict = {}
     for m in cluster_meta:
         raw = m.get("__rawtags__") or {}
         key = tuple((raw.get(t) or [""])[0].lower() for t in _SPLIT_VERSION_TAGS)
         groups.setdefault(key, []).append(m)
     return list(groups.values())
+
+
+def _acoustic_version_labels(vals: list) -> list:
+    """ボーカル有無指標 (compute_vocalness) の list から版ラベルを返す。
+    **メタデータ非依存**。同曲 cluster 内で vocal 版は instrumental 版より高い値に
+    なるため、明確な相対ギャップがあれば低い側 (instrumental) を別ラベル(1)にする。
+    ギャップ不明瞭 (= 同一視聴体験の重複) なら全て同ラベル(0)。"""
+    if not vals or any(v is None for v in vals) or len(vals) < 2:
+        return [0] * len(vals)
+    gap_abs = float(os.environ.get("DSRE_VOCAL_GAP_ABS", "0.03"))
+    gap_ratio = float(os.environ.get("DSRE_VOCAL_GAP_RATIO", "3.0"))
+    order = sorted(range(len(vals)), key=lambda i: vals[i])
+    sv = [vals[i] for i in order]
+    gaps = [sv[i + 1] - sv[i] for i in range(len(sv) - 1)]
+    gi = max(range(len(gaps)), key=lambda i: gaps[i])
+    maxgap = gaps[gi]
+    second = max([g for k, g in enumerate(gaps) if k != gi], default=0.0)
+    # 明確なギャップ = 絶対値が十分大きく、かつ 2 番目のギャップを大きく上回る
+    if maxgap >= gap_abs and maxgap >= gap_ratio * second:
+        labels = [0] * len(vals)
+        for k in range(gi + 1):       # 低い側 (instrumental) を label 1
+            labels[order[k]] = 1
+        return labels
+    return [0] * len(vals)
 
 
 # ===== アプリアイコン (logo.ico) =====
@@ -1846,6 +1915,21 @@ class WorkflowOrchestrator:
         meta = [MetadataExtractor.extract(p) for p in cluster]
         return meta
 
+    def version_groups(self, metas: list) -> list:
+        """chroma 同曲 cluster を「視聴体験が異なる版」ごとに分割する。
+        主信号は **音響ボーカル有無** (compute_vocalness、メタデータ非依存)。
+        加えてタグ (vocal_type/live_type/arrange_type/version_info) があれば併用
+        (タグが無くても音響だけで vocal/instrumental を分離できる)。
+        cover_type/remaster 等では分割しない (同一視聴体験 → 最良 1 個に dedup)。"""
+        vals = [self.fp_engine.compute_vocalness(m["__path__"]) for m in metas]
+        labels = _acoustic_version_labels(vals)
+        groups: dict = {}
+        for m, lab in zip(metas, labels):
+            raw = m.get("__rawtags__") or {}
+            tagkey = tuple((raw.get(t) or [""])[0].lower() for t in _SPLIT_VERSION_TAGS)
+            groups.setdefault((lab,) + tagkey, []).append(m)
+        return list(groups.values())
+
     def score_files(self, meta_list: list) -> list:
         out = []
         for m in meta_list:
@@ -1927,15 +2011,17 @@ class WorkflowOrchestrator:
         for c in clusters:
             if self.abort_cb():
                 break
-            meta = self.harmonize_metadata(c)
-            # chroma 同曲 cluster 内を「別視聴バージョン」(インスト/オフボーカル/ライブ/
-            # アレンジ) ごとに分割し、各バージョンで最良 1 個を残す。cover_type/remaster
-            # 等は分割しない (同一視聴体験 → 1 個に dedup)。
-            for vg in _split_versions_for_dedup(meta):
-                best = self.process_subcluster(vg)
+            metas = [MetadataExtractor.extract(p) for p in c]
+            # 先に「視聴体験が異なる版」(音響ボーカル有無 + タグ) で分割し、
+            # **各版グループ内で** メタ統合する。cluster 全体を一括統合すると
+            # vocal(track1) と instrumental(track2) で tracknumber 等が混線するため。
+            for g in self.version_groups(metas):
+                MetadataPropagator.propagate(g)  # 版グループ内で統合
+                g2 = [MetadataExtractor.extract(m["__path__"]) for m in g]
+                best = self.process_subcluster(g2)
                 if best:
                     bests.append(best)
-            all_meta.extend(meta)
+                all_meta.extend(g2)
 
         self.progress_cb(f"[STAGE 1] 最良選択 {len(bests)} 完了")
 

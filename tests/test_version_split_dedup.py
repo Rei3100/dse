@@ -32,3 +32,25 @@ def test_cover_type_does_not_split():
         meta=[MetadataExtractor.extract(p) for p in (a,b)]
         groups=_split_versions_for_dedup(meta)
         assert len(groups)==1  # カバーは同一グループ
+
+def test_acoustic_labels_clear_gap_splits():
+    """明確なボーカル有無ギャップ → instrumental(低)を別ラベルに分離 (メタ非依存)。"""
+    from DSRE import _acoustic_version_labels
+    # vocal 高 (0.30) x3 + instrumental 低 (0.19) x2
+    labels=_acoustic_version_labels([0.30,0.301,0.299,0.19,0.191])
+    # 低い2つが同ラベル、高い3つが別ラベル → 2 グループ
+    assert len(set(labels))==2
+    groups={}
+    for i,l in enumerate(labels): groups.setdefault(l,[]).append(i)
+    sizes=sorted(len(v) for v in groups.values())
+    assert sizes==[2,3]
+
+def test_acoustic_labels_no_gap_single_group():
+    """差が小さい (同一視聴体験の重複) → 全て同ラベル (分割しない)。"""
+    from DSRE import _acoustic_version_labels
+    assert len(set(_acoustic_version_labels([0.30,0.29,0.31,0.30])))==1
+
+def test_acoustic_labels_none_skips():
+    """vocalness 取得不能 (None) があれば音響分割しない。"""
+    from DSRE import _acoustic_version_labels
+    assert _acoustic_version_labels([0.3,None,0.19])==[0,0,0]
