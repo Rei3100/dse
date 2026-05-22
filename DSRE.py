@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r128"
+_DSRE_VERSION = "r129"
 
 
 # ===== DSP パラメータ =====
@@ -1098,6 +1098,105 @@ def run_hidden_cancellable(cmd, register=None, unregister=None, poll_interval=0.
                 unregister(p)
             except Exception:
                 pass
+
+
+# ===== フラグ閾値定数 =====
+_BRICK_WALL_FLATNESS = float(os.environ.get("DSRE_FLAG_FLATNESS", "0.05"))
+_LOSSY_HF_RATIO_16K = float(os.environ.get("DSRE_FLAG_HF16K", "0.0005"))
+_LOSSY_ROLLOFF_HZ = float(os.environ.get("DSRE_FLAG_ROLLOFF", "17000"))
+_HYPER_COMP_DR = float(os.environ.get("DSRE_FLAG_DR", "6"))
+_ART_HARMONIC = float(os.environ.get("DSRE_FLAG_HARMONIC", "0.5"))
+_ART_DR_THRESHOLD = float(os.environ.get("DSRE_FLAG_ART_DR", "12"))
+_UPSAMPLE_HF8K = float(os.environ.get("DSRE_FLAG_HF8K", "0.3"))
+_UPSAMPLE_CENTROID = float(os.environ.get("DSRE_FLAG_CENTROID", "6000"))
+_SCORE_W_DR = float(os.environ.get("DSRE_SCORE_WEIGHT_DR", "3.0"))
+_SCORE_LUFS_TARGET = float(os.environ.get("DSRE_SCORE_LUFS_TARGET", "-14"))
+
+
+class ScoreResult:
+    __slots__ = ("score", "metrics", "flagged", "flag_reasons")
+    def __init__(self, score, metrics, flagged, flag_reasons):
+        self.score = score
+        self.metrics = metrics
+        self.flagged = flagged
+        self.flag_reasons = flag_reasons
+
+
+class QualityProbe:
+    """採点: file → 正規化 → 直接解析 → スコア + フラグ。opus エンコードなし。"""
+
+    @staticmethod
+    def score(path: str) -> "ScoreResult | None":
+        try:
+            audio, sr = load_audio_safe(path)
+        except Exception:
+            return None
+
+        # load_audio_safe は (channels, samples)、_dsre_normalize_volume は (samples, channels)
+        if audio.ndim == 1:
+            norm_in = audio.reshape(-1, 1)
+        else:
+            norm_in = audio.T  # (samples, channels)
+
+        try:
+            norm = _dsre_normalize_volume(norm_in, sr)
+        except Exception:
+            norm = norm_in
+
+        # MetricsComputer は (samples,) or (2, samples) を受ける → (channels, samples) に戻す
+        if norm.ndim == 2:
+            audio_for_metrics = norm.T  # (channels, samples)
+        else:
+            audio_for_metrics = norm
+
+        try:
+            metrics = MetricsComputer.compute(audio_for_metrics, sr)
+        except Exception:
+            return None
+
+        score, flagged, reasons = QualityProbe._calculate(metrics)
+        return ScoreResult(score, metrics, flagged, reasons)
+
+    @staticmethod
+    def _calculate(metrics: dict) -> tuple:
+        def clamp(v, lo, hi):
+            return max(lo, min(hi, v))
+
+        score = 0.0
+        dr = metrics.get("dr") or 0.0
+        lufs = metrics.get("lufs")
+        hf12k = metrics.get("hf_ratio_12k") or 0.0
+        flatness = metrics.get("flatness") or 0.0
+        plr = metrics.get("plr")
+
+        score += clamp(dr, 0, 20) * _SCORE_W_DR
+        if lufs is not None:
+            score += clamp(20 - abs(lufs - _SCORE_LUFS_TARGET), 0, 20)
+        score += clamp(hf12k, 0, 0.05) * 200
+        score += clamp(flatness, 0, 0.5) * 20
+        if plr is not None and plr < 6:
+            score -= (6 - plr) * 2
+        score = clamp(score, 0, 100)
+
+        reasons = []
+        hf16k = metrics.get("hf_ratio_16k") or 0.0
+        rolloff = metrics.get("rolloff_hz") or 99999
+        harmonic = metrics.get("harmonic_1k_proxy") or 0.0
+        hf8k = metrics.get("hf_ratio_8k") or 0.0
+        centroid = metrics.get("centroid_hz") or 0.0
+
+        if hf16k < _LOSSY_HF_RATIO_16K and rolloff < _LOSSY_ROLLOFF_HZ:
+            reasons.append("lossy_hf_cliff")
+        if flatness < _BRICK_WALL_FLATNESS:
+            reasons.append("brick_wall_flatness")
+        if dr < _HYPER_COMP_DR:
+            reasons.append("hyper_compression")
+        if harmonic > _ART_HARMONIC and dr > _ART_DR_THRESHOLD:
+            reasons.append("artifact_high_harmonic")
+        if hf8k > _UPSAMPLE_HF8K and centroid > _UPSAMPLE_CENTROID:
+            reasons.append("upsample_artifact")
+
+        return score, len(reasons) > 0, reasons
 
 
 # ===== 安全読み込み =====
