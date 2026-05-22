@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r127"
+_DSRE_VERSION = "r128"
 
 
 # ===== DSP パラメータ =====
@@ -1023,6 +1023,23 @@ class MetadataPropagator:
                     f.save()
             except Exception:
                 pass
+
+
+
+def split_versions(cluster: list) -> list:
+    """cluster を version 識別系タグの組で sub-cluster に分割。
+
+    cluster: メタデータ伝播済の dict list。
+    戻り値: sub-cluster の list of list。
+    """
+    groups: dict = {}
+    for m in cluster:
+        key = tuple(m.get(k, "") for k in [
+            "version_info", "cover_type", "live_type", "vocal_type",
+            "remaster_info", "arrange_type", "m_number",
+        ])
+        groups.setdefault(key, []).append(m)
+    return list(groups.values())
 
 # ===== アプリアイコン (logo.ico) =====
 def _logo_path() -> str | None:
