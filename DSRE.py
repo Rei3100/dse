@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r137"
+_DSRE_VERSION = "r138"
 
 
 # ===== DSP パラメータ =====
@@ -3688,9 +3688,51 @@ def _run_selftest() -> int:
         return 1
 
 
+def _run_workflow_selftest() -> int:
+    """凍結バイナリで STAGE 1 ワークフローを実 INPUT ファイルで検証する。
+    INPUT_DIR top-level の flac をサンドボックスに複製し run_stage1 を完走
+    させる (実ファイルは触らない)。GUI クリックなしで「開始経路が生きているか」
+    を実測する手段。"""
+    import tempfile, traceback
+    add_ffmpeg_to_path()
+    src = INPUT_DIR
+    flacs = ([f for f in os.listdir(src) if f.lower().endswith(".flac")]
+             if os.path.isdir(src) else [])
+    sb = tempfile.mkdtemp(prefix="dsre_wfst_")
+    try:
+        indir = os.path.join(sb, "in")
+        outdir = os.path.join(indir, "Output")
+        os.makedirs(outdir)
+        cand = []
+        for f in flacs[:3]:
+            dst = os.path.join(indir, f)
+            shutil.copy2(os.path.join(src, f), dst)
+            cand.append(dst)
+        print(f"workflow-selftest: INPUT top-level flac={len(flacs)} using={len(cand)}")
+        orch = WorkflowOrchestrator(
+            input_dir=indir, output_dir=outdir,
+            db_path=os.path.join(sb, "fp.db"),
+            progress_cb=lambda s: print("  ", s),
+        )
+        res = orch.run_stage1(candidates=cand)
+        del orch
+        ok = (len(cand) == 0) or (len(res) >= 1)
+        print(f"workflow-selftest: stage1_out={len(res)} "
+              f"verdict={'OK' if ok else 'FAIL'}")
+        return 0 if ok else 1
+    except Exception:
+        traceback.print_exc()
+        print("workflow-selftest verdict=FAIL")
+        return 1
+    finally:
+        shutil.rmtree(sb, ignore_errors=True)
+
+
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_run_selftest())
+    if "--workflow-selftest" in sys.argv:
+        sys.exit(_run_workflow_selftest())
     add_ffmpeg_to_path()
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
