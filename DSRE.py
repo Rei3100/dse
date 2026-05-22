@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r134"
+_DSRE_VERSION = "r135"
 
 
 # ===== DSP パラメータ =====
@@ -1462,7 +1462,12 @@ class WorkflowOrchestrator:
     def process_subcluster(self, sub: list):
         scored = self.score_files(sub)
         if not scored:
-            return None
+            # 採点失敗 (MetricsComputer エラー等): ファイルを落とさずサイズ最大を best に
+            if not sub:
+                return None
+            best_path = max((m["__path__"] for m in sub),
+                            key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0)
+            return BestSelection(best_path, None, False)
         best = BestSelector.choose(scored)
         for path, sr, sz in scored:
             if path == best.path:
@@ -2878,8 +2883,15 @@ class Worker(QtCore.QThread):
                 progress_cb=self.sig_text.emit,
                 abort_cb=lambda: self._abort,
             )
-            workflow_files = orch.run_stage1()
-            self.files = workflow_files
+            try:
+                workflow_files = orch.run_stage1()
+            except Exception as _e:
+                self.sig_text.emit(f"[STAGE 1] エラー: {_e}")
+                workflow_files = []
+            # scan_pending が 0 件でも元リスト (GUI 選択) を維持してフォールバック
+            if workflow_files:
+                self.files = workflow_files
+            # workflow_files=[] は「処理対象なし or 全 skip」なので元リストをそのまま使う
             total = len(self.files)
 
         pending = list(self.files)
