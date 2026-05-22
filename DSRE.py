@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r145"
+_DSRE_VERSION = "r146"
 
 
 # ===== DSP パラメータ =====
@@ -1204,6 +1204,25 @@ def split_versions(cluster: list) -> list:
         groups.setdefault(key, []).append(m)
     return list(groups.values())
 
+
+# dedup 時に「別バージョンとして残す」版識別タグ (= 視聴体験が異なる)。
+# cover_type / remaster_info / m_number / featuring / produced は含めない
+# (同一視聴体験 → 最良 1 個に dedup する)。
+_SPLIT_VERSION_TAGS = ("vocal_type", "live_type", "arrange_type", "version_info")
+
+
+def _split_versions_for_dedup(cluster_meta: list) -> list:
+    """同曲 (chroma) cluster を、視聴体験が異なる版 (インスト/オフボーカル/ライブ/
+    アレンジ) ごとに分割する。各 sub-group 内は同一視聴体験なので最良 1 個に dedup。
+    例: vocal 版 3 + instrumental 版 2 → [vocal3, instrumental2] の 2 group。"""
+    groups: dict = {}
+    for m in cluster_meta:
+        raw = m.get("__rawtags__") or {}
+        key = tuple((raw.get(t) or [""])[0].lower() for t in _SPLIT_VERSION_TAGS)
+        groups.setdefault(key, []).append(m)
+    return list(groups.values())
+
+
 # ===== アプリアイコン (logo.ico) =====
 def _logo_path() -> str | None:
     return _find_bundled("logo.ico")
@@ -1908,12 +1927,14 @@ class WorkflowOrchestrator:
         for c in clusters:
             if self.abort_cb():
                 break
-            # acoustic に同曲と判定された cluster は、版違い ([Cover]/[mqms2] 等) でも
-            # 1 つの最良 (音質) に dedup する。version タグでの分割はしない (同曲は同曲)。
             meta = self.harmonize_metadata(c)
-            best = self.process_subcluster(meta)
-            if best:
-                bests.append(best)
+            # chroma 同曲 cluster 内を「別視聴バージョン」(インスト/オフボーカル/ライブ/
+            # アレンジ) ごとに分割し、各バージョンで最良 1 個を残す。cover_type/remaster
+            # 等は分割しない (同一視聴体験 → 1 個に dedup)。
+            for vg in _split_versions_for_dedup(meta):
+                best = self.process_subcluster(vg)
+                if best:
+                    bests.append(best)
             all_meta.extend(meta)
 
         self.progress_cb(f"[STAGE 1] 最良選択 {len(bests)} 完了")
