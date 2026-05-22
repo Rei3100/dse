@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r122"
+_DSRE_VERSION = "r123"
 
 
 # ===== DSP パラメータ =====
@@ -735,6 +735,92 @@ def _resolve_fpcalc_path() -> "str | None":
         return found
     from shutil import which
     return which("fpcalc") or which("fpcalc.exe") or None
+
+
+# ===== FingerprintEngine (chromaprint acoustic fingerprint + SQLite cache) =====
+
+class FingerprintResult:
+    __slots__ = ("duration_sec", "fingerprint", "content_hash")
+    def __init__(self, duration_sec: float, fingerprint: str, content_hash: str):
+        self.duration_sec = duration_sec
+        self.fingerprint = fingerprint
+        self.content_hash = content_hash
+
+
+class FingerprintEngine:
+    """chromaprint (fpcalc.exe) で acoustic fingerprint を取得し SQLite にキャッシュ。"""
+
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            db_path = METRICS_DB_PATH
+        self.db_path = db_path
+        self.fpcalc = _resolve_fpcalc_path()
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self.db_path) as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS fingerprints (
+                    content_hash TEXT PRIMARY KEY,
+                    duration_sec REAL NOT NULL,
+                    fingerprint  TEXT NOT NULL,
+                    last_path    TEXT,
+                    computed_at  TEXT NOT NULL
+                )
+            """)
+
+    @staticmethod
+    def _content_hash(path: str) -> str:
+        """size + 先頭64KB + 末尾64KB の md5。content-addressing。"""
+        import hashlib
+        h = hashlib.md5()
+        size = os.path.getsize(path)
+        h.update(size.to_bytes(8, "little"))
+        with open(path, "rb") as f:
+            h.update(f.read(64 * 1024))
+            if size > 128 * 1024:
+                f.seek(-64 * 1024, os.SEEK_END)
+                h.update(f.read(64 * 1024))
+        return h.hexdigest()
+
+    def compute(self, path: str) -> "FingerprintResult | None":
+        if self.fpcalc is None:
+            return None
+        try:
+            ch = self._content_hash(path)
+        except OSError:
+            return None
+        # cache 確認
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute(
+                "SELECT duration_sec, fingerprint FROM fingerprints WHERE content_hash = ?",
+                (ch,),
+            ).fetchone()
+            if row:
+                return FingerprintResult(row[0], row[1], ch)
+        # fpcalc 呼び出し
+        try:
+            result = subprocess.run(
+                [self.fpcalc, "-json", path],
+                capture_output=True, text=True, timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0:
+                return None
+            import json
+            obj = json.loads(result.stdout)
+            duration = float(obj["duration"])
+            fp = str(obj["fingerprint"])
+        except (subprocess.TimeoutExpired, Exception):
+            return None
+        # cache 書き込み
+        with sqlite3.connect(self.db_path) as c:
+            c.execute(
+                "INSERT OR REPLACE INTO fingerprints VALUES (?, ?, ?, ?, ?)",
+                (ch, duration, fp, path, datetime.datetime.utcnow().isoformat()),
+            )
+        return FingerprintResult(duration, fp, ch)
+
 
 
 # ===== アプリアイコン (logo.ico) =====
