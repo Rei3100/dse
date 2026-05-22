@@ -61,20 +61,25 @@ def test_propagate_to_untagged():
         assert bf.pictures[0].mime == "image/jxl"
 
 
-def test_propagate_respects_existing_value():
-    """伝播先が既値を持つタグは上書きしない。"""
+def test_propagate_unifies_conflicting_value():
+    """非 version タグは canonical 値で上書き統一される (差を残さない)。
+    canonical は完備度最大 file なので良メタが潰される事故は起きない。"""
     from DSRE import MetadataPropagator, MetadataExtractor
     from mutagen.flac import FLAC
     with tempfile.TemporaryDirectory() as d:
         a = os.path.join(d, "a.flac")
-        _mk(a, {"artist": "X", "genre": "G"})
+        _mk(a, {"artist": "X", "album": "AL", "title": "T", "genre": "G"})
         b = os.path.join(d, "b.flac")
-        _mk(b, {"genre": "B-genre"})
+        _mk(b, {"genre": "B-genre"})  # b は低メタ (canonical にならない)
         meta = [MetadataExtractor.extract(p) for p in (a, b)]
+        canon = MetadataPropagator.choose_canonical(meta)
+        assert canon["__path__"] == a  # 完備な a が canonical
         MetadataPropagator.propagate(meta)
         bf = FLAC(b)
-        assert bf["genre"][0] == "B-genre"
+        assert bf["genre"][0] == "G"      # B-genre は canonical G で統一
         assert bf["artist"][0] == "X"
+        assert bf["album"][0] == "AL"
+        assert bf["title"][0] == "T"
 
 
 def test_version_tags_never_propagated():
