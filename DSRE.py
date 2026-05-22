@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r136"
+_DSRE_VERSION = "r137"
 
 
 # ===== DSP パラメータ =====
@@ -2783,6 +2783,20 @@ class Worker(QtCore.QThread):
         self._mutex.unlock()
 
     def run(self):
+        # QThread.run() の例外は Qt が静かに握り潰しスレッドが死ぬ (ラベル「待機」
+        # のまま・CPU 不動の正体)。本体を _run_impl に分離し、ここで全例外を
+        # GUI ラベルへ surface して「無反応」を構造的に防ぐ。
+        try:
+            self._run_impl()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self.sig_text.emit(f"エラー: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+    def _run_impl(self):
         from concurrent.futures import ThreadPoolExecutor, as_completed  # noqa: F401
 
         try:
@@ -2919,18 +2933,22 @@ class Worker(QtCore.QThread):
             return "ok"
 
         # ---- STAGE 1: scan -> fingerprint -> cluster -> select -> relocate ----
+        # 構築 + 実行を丸ごと try で囲む。orch 構築 (FingerprintEngine の SQLite
+        # オープン等) が例外を投げても QThread.run() が静かに死なないよう保証する。
+        # STAGE 1 が失敗しても GUI 選択 (self.files) をそのまま通常処理へ流す。
         orch = None
         if os.environ.get("DSRE_WORKFLOW", "1") == "1":
-            orch = WorkflowOrchestrator(
-                input_dir=INPUT_DIR,
-                output_dir=OUTPUT_DIR,
-                progress_cb=self.sig_text.emit,
-                abort_cb=lambda: self._abort,
-            )
             try:
+                orch = WorkflowOrchestrator(
+                    input_dir=INPUT_DIR,
+                    output_dir=OUTPUT_DIR,
+                    progress_cb=self.sig_text.emit,
+                    abort_cb=lambda: self._abort,
+                )
                 workflow_files = orch.run_stage1(candidates=list(self.files))
             except Exception as _e:
-                self.sig_text.emit(f"[STAGE 1] エラー: {_e}")
+                self.sig_text.emit(f"[STAGE 1] スキップ ({type(_e).__name__})")
+                orch = None
                 workflow_files = []
             # scan_pending が 0 件でも元リスト (GUI 選択) を維持してフォールバック
             if workflow_files:
