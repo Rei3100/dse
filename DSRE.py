@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r143"
+_DSRE_VERSION = "r144"
 
 
 # ===== DSP パラメータ =====
@@ -1551,6 +1551,27 @@ def _resolve_collision(target: str, src: str) -> str:
     return f"{base}_{n}{ext}"
 
 
+def _sort_output_into_foobar(out_path: str) -> str:
+    """出力 file 1 個を即 OUTPUT_DIR 内の foobar 階層へ仕分ける (per-file)。
+    全処理完了を待たないので、途中終了しても既出力は仕分け済みになる。
+    multi-disc 判定はこの file 単体の discnumber で行う (album 全体の文脈は
+    最終 STAGE 3 reconciliation が補正する)。失敗時は元パスを返す。"""
+    try:
+        m = MetadataExtractor.extract(out_path)
+        disc = (m.get("discnumber") or "1")
+        multi = (disc not in ("1", "01", "")
+                 or os.environ.get("DSRE_DISC_DIR_ALWAYS") == "1")
+        new_path = FoobarPathBuilder.build(OUTPUT_DIR, m, multi_disc=multi)
+        new_path = _resolve_collision(new_path, out_path)
+        if os.path.normcase(os.path.abspath(new_path)) != \
+           os.path.normcase(os.path.abspath(out_path)):
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            os.rename(out_path, new_path)
+        return new_path
+    except Exception:
+        return out_path
+
+
 def _prune_empty_dirs(start_dir: str, boundary: str = None) -> None:
     """start_dir から上方向に空ディレクトリを削除する。処理前音源が移動/破棄で
     消えた後、空になった関連フォルダが溜まらないようにする。
@@ -1576,6 +1597,50 @@ def _prune_empty_dirs(start_dir: str, boundary: str = None) -> None:
         cur = os.path.dirname(cur)
 
 
+# 入力スキャンで降りないフォルダ名 (リファレンス置き場等、処理対象外)。
+_EXCLUDED_INPUT_DIRS = frozenset({"ref"})
+
+
+def _is_excluded_input_dir(path: str, input_dir: str) -> bool:
+    """path が INPUT 配下の除外フォルダ (_EXCLUDED_INPUT_DIRS) 内かを判定。"""
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(input_dir))
+    except Exception:
+        return False
+    parts = rel.replace("\\", "/").split("/")
+    return any(seg.lower() in _EXCLUDED_INPUT_DIRS for seg in parts[:-1])
+
+
+def _scan_pending_files(input_dir: str, output_dir: str) -> list:
+    """INPUT_DIR を再帰スキャンし、処理前 (未処理) の flac path list を返す。
+    除外: OUTPUT_DIR サブツリー (処理後)、ref 等の除外フォルダ、dsre_version 済タグ。
+    tool が relocate したサブフォルダ内の未処理 file も拾える (再起動後の継続用)。"""
+    from mutagen.flac import FLAC
+    out = []
+    on = os.path.normcase(os.path.abspath(output_dir))
+    in_norm = os.path.normcase(os.path.abspath(input_dir))
+    prune_out = (on != in_norm)  # OUTPUT==INPUT の退化ケースは枝刈りしない
+    for root, dirs, files in os.walk(input_dir):
+        rn = os.path.normcase(os.path.abspath(root))
+        if prune_out and (rn == on or rn.startswith(on + os.sep)):
+            dirs[:] = []
+            continue
+        # 除外フォルダ (ref 等) は降りない
+        dirs[:] = [dd for dd in dirs if dd.lower() not in _EXCLUDED_INPUT_DIRS]
+        for fn in files:
+            if not fn.lower().endswith(".flac"):
+                continue
+            p = os.path.join(root, fn)
+            try:
+                f = FLAC(p)
+                if f.tags and "dsre_version" in f.tags:
+                    continue
+            except Exception:
+                pass
+            out.append(p)
+    return out
+
+
 class WorkflowOrchestrator:
     """STAGE 1-3 統括: スキャン -> 指紋 -> クラスタ -> 伝播 -> 採点 -> 選択 -> 破棄 -> 仕分け。"""
 
@@ -1599,43 +1664,17 @@ class WorkflowOrchestrator:
         return pn == on or pn.startswith(on + os.sep)
 
     def scan_pending(self) -> list:
-        """INPUT_DIR を再帰スキャンして dsre_version 未持ちの flac path list を返す。
-        OUTPUT_DIR は INPUT_DIR 配下にあるため、その全サブツリーを常に枝刈りする
-        (処理済み出力を入力として拾うと全ライブラリを再編成してしまう)。"""
-        from mutagen.flac import FLAC
-        out = []
-        on = os.path.normcase(os.path.abspath(self.output_dir))
-        in_norm = os.path.normcase(os.path.abspath(self.input_dir))
-        # output_dir が input_dir の真サブツリーの時のみ枝刈り。両者同一の
-        # 退化ケース (テスト等) では枝刈りせず dsre_version タグだけで濾す。
-        prune = (on != in_norm)
-        for root, dirs, files in os.walk(self.input_dir):
-            rn = os.path.normcase(os.path.abspath(root))
-            if prune and (rn == on or rn.startswith(on + os.sep)):
-                dirs[:] = []  # OUTPUT_DIR 配下は降りない
-                continue
-            for fn in files:
-                if not fn.lower().endswith(".flac"):
-                    continue
-                p = os.path.join(root, fn)
-                try:
-                    f = FLAC(p)
-                    if f.tags and "dsre_version" in f.tags:
-                        continue
-                except Exception:
-                    pass
-                out.append(p)
-        return out
+        """INPUT_DIR を再帰スキャンし、未処理 (dsre_version 無し) の flac を返す。"""
+        return _scan_pending_files(self.input_dir, self.output_dir)
 
     def _filter_candidates(self, candidates: list) -> list:
-        """GUI 選択 file list を入力候補として濾す。OUTPUT_DIR 配下と
-        dsre_version 既処理タグ持ちを除外する (再処理・再編成の暴発防止)。"""
+        """候補 list を入力対象として濾す。OUTPUT_DIR 配下 / ref / dsre_version 済を除外。"""
         from mutagen.flac import FLAC
         res = []
         for p in candidates:
             if not p.lower().endswith(".flac"):
                 continue
-            if self._is_under_output(p):
+            if self._is_under_output(p) or _is_excluded_input_dir(p, self.input_dir):
                 continue
             try:
                 f = FLAC(p)
@@ -3100,6 +3139,9 @@ class Worker(QtCore.QThread):
                 _log_failure(path, "save_fail", e)
                 raise
             _embed_output_metadata(out, pictures)
+            # per-file 仕分け: 出力した直後に foobar 階層へ移す (途中終了対策)。
+            if orch is not None:
+                out = _sort_output_into_foobar(out)
             _check_abort()
 
             try:
@@ -3259,23 +3301,35 @@ class Worker(QtCore.QThread):
         else:
             self.sig_text.emit(f"完了  {succeeded}/{total}")
 
-        # ---- STAGE 3: sort OUTPUT_DIR into foobar layout ----
+        # ---- STAGE 3: 最終 reconciliation (per-file 仕分けの multi-disc 補正) ----
+        # 通常は per-file 仕分け済。ここは album 全体文脈での multi-disc 整列補正のみ。
+        # OUTPUT_DIR は既に foobar サブフォルダ化されているため再帰スキャンする。
         if orch is not None and not self._abort:
             try:
                 from mutagen.flac import FLAC as _FLAC3
                 processed = []
                 if os.path.isdir(OUTPUT_DIR):
-                    for fn in os.listdir(OUTPUT_DIR):
-                        p3 = os.path.join(OUTPUT_DIR, fn)
-                        if not p3.lower().endswith(".flac"):
-                            continue
-                        try:
-                            tf = _FLAC3(p3)
-                            if tf.tags and "dsre_version" in tf.tags:
-                                processed.append(p3)
-                        except Exception:
-                            pass
+                    for root3, _d3, files3 in os.walk(OUTPUT_DIR):
+                        for fn in files3:
+                            if not fn.lower().endswith(".flac"):
+                                continue
+                            p3 = os.path.join(root3, fn)
+                            try:
+                                tf = _FLAC3(p3)
+                                if tf.tags and "dsre_version" in tf.tags:
+                                    processed.append(p3)
+                            except Exception:
+                                pass
                 orch.run_stage3(processed)
+                # 仕分けで空になった OUTPUT 内サブフォルダを掃除
+                for root3, dirs3, files3 in os.walk(OUTPUT_DIR, topdown=False):
+                    if root3 == OUTPUT_DIR:
+                        continue
+                    try:
+                        if not os.listdir(root3):
+                            os.rmdir(root3)
+                    except OSError:
+                        pass
             except Exception:
                 pass
 
@@ -3417,21 +3471,11 @@ class MainWindow(QtWidgets.QWidget):
 
     # ---- ファイル処理 ----
     def load_files(self):
-        files = []
-
-        existing = set()
-        if os.path.exists(OUTPUT_DIR):
-            existing = {os.path.splitext(f)[0] for f in os.listdir(OUTPUT_DIR)}
-
+        # INPUT_DIR を再帰スキャンし処理前 file を集める (OUTPUT/ref/dsre_version 除外)。
+        # tool が relocate したサブフォルダ内の未処理 file も再起動後に拾える。
         if not os.path.exists(INPUT_DIR):
-            return files
-
-        for f in os.listdir(INPUT_DIR):
-            if f.lower().endswith(".flac"):
-                if os.path.splitext(f)[0] not in existing:
-                    files.append(os.path.join(INPUT_DIR, f))
-
-        return files
+            return []
+        return _scan_pending_files(INPUT_DIR, OUTPUT_DIR)
 
     def start(self):
         if self.worker and self.worker.isRunning():
