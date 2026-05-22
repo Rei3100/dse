@@ -34,7 +34,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r120"
+_DSRE_VERSION = "r121"
 
 
 # ===== DSP パラメータ =====
@@ -1054,6 +1054,26 @@ def _log_trim(path, head_s, tail_s, applied=False):
         pass
 
 
+def _dsre_normalize_volume(data: "np.ndarray", sr: int) -> "np.ndarray":
+    """音量最適化: true peak で TP_TARGET_DBFS に正規化し clip=0 を構造保証。
+
+    DSRE_VOLUME_OPTIMIZE=0 で旧動作 (sample peak > 1.0 のみ正規化) に分岐。
+    `data` は samples-first (samples, channels) の float32。save_flac24_out の
+    内部 data 形状と同一。戻り値は data と同 shape、dtype=float32。
+    """
+    data = data.astype(np.float32, copy=False)
+    if os.environ.get("DSRE_VOLUME_OPTIMIZE") != "0":
+        tp = _true_peak(data)
+        if tp > 0:
+            target = 10.0 ** (TP_TARGET_DBFS / 20.0)
+            data = (data * (target / tp)).astype(np.float32, copy=False)
+    else:
+        peak = float(np.max(np.abs(data))) if data.size else 0.0
+        if peak > 1.0:
+            data = data / peak
+    return data
+
+
 def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister_proc=None):
     """DSP 結果を FLAC <TARGET_SR=96kHz> / PCM_24 として書き出し、ffmpeg でメタデータを継承する。
 
@@ -1081,18 +1101,7 @@ def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister
         data = y_out.T
     data = data.astype(np.float32, copy=False)
 
-    # 音量最適化: 4x oversampling で true peak を計測し 0 dBFS に正規化 (上下両方向)。
-    # CLIP=0 を保証しつつ静かな音源は引き上げ、うるさい音源は引き下げる (per-track)。
-    # DSRE_VOLUME_OPTIMIZE=0 で旧動作 (sample peak > 1.0 のみ正規化) に戻す。
-    if os.environ.get("DSRE_VOLUME_OPTIMIZE") != "0":
-        tp = _true_peak(data)
-        if tp > 0:
-            target = 10.0 ** (TP_TARGET_DBFS / 20.0)
-            data = (data * (target / tp)).astype(np.float32, copy=False)
-    else:
-        peak = float(np.max(np.abs(data))) if data.size else 0.0
-        if peak > 1.0:
-            data = data / peak
+    data = _dsre_normalize_volume(data, sr)
 
     base = os.path.splitext(out_path)[0]
     final_path = base + OUTPUT_EXT
