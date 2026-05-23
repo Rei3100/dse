@@ -25,6 +25,18 @@ for mod in (
     "pyloudnorm",
     "future",
     "mutagen",
+    # ===== Demucs ボーカル分離 (編成判定) + 依存 =====
+    "demucs",
+    "torch",
+    "torchaudio",
+    "dora",
+    "omegaconf",
+    "antlr4",
+    "einops",
+    "julius",
+    "openunmix",
+    "treetable",
+    "lameenc",
 ):
     d, b, h = collect_all(mod)
     datas += d

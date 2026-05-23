@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r148"
+_DSRE_VERSION = "r149"
 
 
 # ===== DSP パラメータ =====
@@ -1043,8 +1043,18 @@ def _get_demucs():
     """htdemucs モデルと device (GPU 使用可なら cuda) を遅延ロードして返す。"""
     global _DEMUCS_MODEL, _DEMUCS_DEVICE
     if _DEMUCS_MODEL is None:
-        from demucs.pretrained import get_model
         import torch
+        # 同梱 torch_hub (checkpoints に htdemucs .th) があればオフライン解決
+        for base in _resource_base_dirs():
+            for rel in (os.path.join("_internal", "torch_hub"), "torch_hub"):
+                cand = os.path.join(base, rel)
+                if os.path.isdir(os.path.join(cand, "checkpoints")):
+                    try:
+                        torch.hub.set_dir(cand)
+                    except Exception:
+                        pass
+                    break
+        from demucs.pretrained import get_model
         m = get_model("htdemucs")
         m.eval()
         _DEMUCS_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

@@ -27,8 +27,12 @@ jobs:
       - name: 依存インストール
         run: |
           python -m pip install --upgrade pip
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
           pip install -r requirements.txt
           pip install -r requirements-dev.txt
+
+      - name: htdemucs モデル取得 (オフライン同梱用)
+        run: python -c "from demucs.pretrained import get_model; get_model('htdemucs'); print('htdemucs cached')"
 
       - name: requirements 検証 (UTF-16 bytes禁止)
         shell: pwsh
@@ -72,6 +76,17 @@ jobs:
           New-Item -ItemType Directory -Path $dst -Force | Out-Null
           Copy-Item _ffmpeg\ffmpeg.exe (Join-Path $dst "ffmpeg.exe")
           if (-not (Test-Path (Join-Path $dst "ffmpeg.exe"))) { throw "ffmpeg not staged" }
+
+      - name: htdemucs モデルを _internal/torch_hub に同梱 (オフライン)
+        shell: pwsh
+        run: |
+          $src = Join-Path $env:USERPROFILE ".cache\torch\hub\checkpoints"
+          $dst = "dist\DSRE\_internal\torch_hub\checkpoints"
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          $ths = Get-ChildItem $src -Filter *.th -ErrorAction SilentlyContinue
+          if (-not $ths) { throw "htdemucs .th model not found in torch cache" }
+          foreach ($f in $ths) { Copy-Item $f.FullName (Join-Path $dst $f.Name) }
+          Write-Host "staged $($ths.Count) demucs model file(s)"
 
       - name: スモークテスト（必須依存の同梱確認）
         shell: pwsh
