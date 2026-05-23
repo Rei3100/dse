@@ -80,10 +80,14 @@ def test_featuring_in_artist_part():
     assert path.endswith("T - X [feat. Y].flac")
 
 
-def test_long_path_unc_prefix():
-    """250 chars 超過時に \\?\ プレフィックス。"""
-    from DSRE import FoobarPathBuilder
+def test_long_path_raw_then_lp_prefix():
+    r"""build は生パスを返し (prefix なし)、_lp() が正しい 4 文字 \\?\ を付ける。
+    旧実装は build 内で 3 文字 \?\ を付け rename/makedirs を壊していた。"""
+    from DSRE import FoobarPathBuilder, _lp
+    import os
     long = "Long" * 80
     m = _meta(artist="X", album=long, title="T", discnumber="1", tracknumber="1")
     path = FoobarPathBuilder.build("C:/very/long/output", m, multi_disc=False)
-    assert path.startswith("\\?\\")
+    assert not path.startswith("\\\\?\\")  # build は生パス
+    if os.name == "nt":
+        assert _lp(path).startswith("\\\\?\\")  # _lp が正しい 4 文字 prefix

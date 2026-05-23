@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r149"
+_DSRE_VERSION = "r150"
 
 
 # ===== DSP パラメータ =====
@@ -667,7 +667,7 @@ def _extract_flac_pictures(path: str) -> list:
     """FLAC ファイルから PICTURE ブロックを mutagen で抽出する。失敗時は空リストを返す。"""
     try:
         from mutagen.flac import FLAC
-        return list(FLAC(path).pictures)
+        return list(FLAC(_lp(path)).pictures)
     except Exception:
         return []
 
@@ -677,7 +677,7 @@ def _embed_output_metadata(path: str, pictures: list) -> None:
     try:
         import datetime
         from mutagen.flac import FLAC
-        f = FLAC(path)
+        f = FLAC(_lp(path))
         f.clear_pictures()
         for pic in pictures:
             f.add_picture(pic)
@@ -688,6 +688,37 @@ def _embed_output_metadata(path: str, pictures: list) -> None:
         f.save()
     except Exception:
         pass
+
+
+# ===== Windows 長パス (MAX_PATH 260 超) 対応 =====
+def _lp(path: str) -> str:
+    r"""260 字超のパスに \\?\ 拡張プレフィックスを付与する。soundfile(libsndfile) /
+    mutagen / ffmpeg / os すべて \\?\ 絶対パスを受け付ける。多人数 artist や長い
+    アルバム名で出力パスが MAX_PATH を超え sf.write が失敗する問題への対策。"""
+    if os.name != "nt" or not path:
+        return path
+    if path.startswith("\\\\?\\"):
+        return path
+    try:
+        ap = os.path.abspath(path)
+    except Exception:
+        return path
+    if len(ap) < 250:
+        return path
+    if ap.startswith("\\\\"):  # UNC \\server\share → \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + ap[2:]
+    return "\\\\?\\" + ap
+
+
+def _mkparent(path: str) -> None:
+    """path の親ディレクトリを作成する。os.makedirs は \\?\ プレフィックス付きパスで
+    再帰が破綻する (\\? を作ろうとして失敗) ため、プレフィックスを剥がした生パスで
+    作る。ディレクトリ部はファイル名込みの全長と違い 260 字未満に収まる前提。"""
+    d = os.path.dirname(path)
+    if d.startswith("\\\\?\\"):
+        d = d[4:]
+    if d:
+        os.makedirs(d, exist_ok=True)
 
 
 # ===== バンドルリソースのパス解決 =====
@@ -819,9 +850,9 @@ class FingerprintEngine:
         """size + 先頭64KB + 末尾64KB の md5。content-addressing。"""
         import hashlib
         h = hashlib.md5()
-        size = os.path.getsize(path)
+        size = os.path.getsize(_lp(path))
         h.update(size.to_bytes(8, "little"))
-        with open(path, "rb") as f:
+        with open(_lp(path), "rb") as f:
             h.update(f.read(64 * 1024))
             if size > 128 * 1024:
                 f.seek(-64 * 1024, os.SEEK_END)
@@ -884,7 +915,7 @@ class FingerprintEngine:
                 return arr.reshape(12, row[0])
         try:
             import librosa
-            y, sr = librosa.load(path, sr=_CHROMA_SR, mono=True,
+            y, sr = librosa.load(_lp(path), sr=_CHROMA_SR, mono=True,
                                  duration=_CHROMA_MAX_SEC)
             if y.size < _CHROMA_SR:  # 1 秒未満は判定不能
                 return None
@@ -926,7 +957,7 @@ class FingerprintEngine:
                 return float(row[0])
         try:
             import librosa
-            y, sr = librosa.load(path, sr=_CHROMA_SR, mono=True,
+            y, sr = librosa.load(_lp(path), sr=_CHROMA_SR, mono=True,
                                  duration=_CHROMA_MAX_SEC)
             if y.size < _CHROMA_SR:
                 return None
@@ -1003,7 +1034,7 @@ class FingerprintEngine:
             import torch
             from demucs.apply import apply_model
             msr = model.samplerate
-            y, sr = _sf.read(path, dtype="float32")
+            y, sr = _sf.read(_lp(path), dtype="float32")
             if y.ndim == 1:
                 y = np.stack([y, y], axis=1)
             y = y[: sr * _CHROMA_MAX_SEC]
@@ -1095,7 +1126,7 @@ def _mfcc_absolute(y, sr):
 def _absolute_mfcc(path):
     """file path → 絶対フレーム MFCC。失敗時 None。"""
     import librosa
-    y, _sr = librosa.load(path, sr=_CHROMA_SR, mono=True, duration=_MFCC_CAP_SEC)
+    y, _sr = librosa.load(_lp(path), sr=_CHROMA_SR, mono=True, duration=_MFCC_CAP_SEC)
     return _mfcc_absolute(y, _CHROMA_SR)
 
 
@@ -1265,7 +1296,7 @@ class MetadataExtractor:
         out["__path__"] = path
         raw = {}          # 小文字キー → 全値リスト (多値タグ保持)
         try:
-            f = FLAC(path)
+            f = FLAC(_lp(path))
             if f.tags:
                 for key in f.tags.keys():
                     vals = f.tags.get(key)
@@ -1344,7 +1375,7 @@ class MetadataPropagator:
         if meta.get("__pictures__"):
             s += 3
         try:
-            size = os.path.getsize(meta["__path__"])
+            size = os.path.getsize(_lp(meta["__path__"]))
         except OSError:
             size = 0
         return (s, size, meta["__path__"])
@@ -1385,7 +1416,7 @@ class MetadataPropagator:
         from mutagen.flac import FLAC
         for m in group:
             try:
-                f = FLAC(m["__path__"])
+                f = FLAC(_lp(m["__path__"]))
                 if f.tags is None:
                     f.add_tags()
                 changed = False
@@ -1674,7 +1705,7 @@ class DiscardHandler:
         d, name = os.path.split(path)
         new_name = DiscardHandler.PREFIX + name
         new_path = os.path.join(d, new_name)
-        os.rename(path, new_path)
+        os.rename(_lp(path), _lp(new_path))
         if not dry_run:
             try:
                 send2trash(new_path)
@@ -1797,23 +1828,22 @@ class FoobarPathBuilder:
 
         filename = f"{d_pad}.{t_pad}.{title}{artist_part}{modifiers}.flac"
         parts.append(filename)
-
-        path = "\\".join(parts)
-        if len(path) > 250 and not path.startswith("\\?\\"):
-            path = "\\?\\" + path
-        return path
+        # 生パスを返す。長パス (\\?\) 処理は呼び出し側で _lp() を使う。
+        # 旧実装は "\\?\\" = Python で 3 文字 \?\ という malformed prefix を付け、
+        # rename / makedirs を破壊していた (正しい extended prefix は 4 文字 \\?\)。
+        return "\\".join(parts)
 
 
 def _resolve_collision(target: str, src: str) -> str:
     """target が存在する場合、内容一致なら同パス、相違なら _N suffix を付与。"""
-    if not os.path.exists(target):
+    if not os.path.exists(_lp(target)):
         return target
-    if os.path.exists(src):
+    if os.path.exists(_lp(src)):
         try:
             from hashlib import md5
             def _fh(p):
                 h = md5()
-                with open(p, "rb") as fh:
+                with open(_lp(p), "rb") as fh:
                     while True:
                         chunk = fh.read(64 * 1024)
                         if not chunk:
@@ -1826,7 +1856,7 @@ def _resolve_collision(target: str, src: str) -> str:
             pass
     base, ext = os.path.splitext(target)
     n = 2
-    while os.path.exists(f"{base}_{n}{ext}"):
+    while os.path.exists(_lp(f"{base}_{n}{ext}")):
         n += 1
     return f"{base}_{n}{ext}"
 
@@ -1845,8 +1875,8 @@ def _sort_output_into_foobar(out_path: str) -> str:
         new_path = _resolve_collision(new_path, out_path)
         if os.path.normcase(os.path.abspath(new_path)) != \
            os.path.normcase(os.path.abspath(out_path)):
-            os.makedirs(os.path.dirname(new_path), exist_ok=True)
-            os.rename(out_path, new_path)
+            _mkparent(new_path)
+            os.rename(_lp(out_path), _lp(new_path))
         return new_path
     except Exception:
         return out_path
@@ -1912,7 +1942,7 @@ def _scan_pending_files(input_dir: str, output_dir: str) -> list:
                 continue
             p = os.path.join(root, fn)
             try:
-                f = FLAC(p)
+                f = FLAC(_lp(p))
                 if f.tags and "dsre_version" in f.tags:
                     continue
             except Exception:
@@ -2013,7 +2043,7 @@ def _fill_missing_identity(target_path: str, new_meta: dict) -> None:
     無いものだけ補完する (既存値は尊重、コピー手間ゼロ化)。"""
     try:
         from mutagen.flac import FLAC
-        f = FLAC(target_path)
+        f = FLAC(_lp(target_path))
         if f.tags is None:
             f.add_tags()
         existing = {k.lower() for k in f.tags.keys()}
@@ -2068,7 +2098,7 @@ class WorkflowOrchestrator:
             if self._is_under_output(p) or _is_excluded_input_dir(p, self.input_dir):
                 continue
             try:
-                f = FLAC(p)
+                f = FLAC(_lp(p))
                 if f.tags and "dsre_version" in f.tags:
                     continue
             except Exception:
@@ -2168,7 +2198,7 @@ class WorkflowOrchestrator:
             r = QualityProbe.score(m["__path__"])
             if r is None:
                 continue
-            sz = os.path.getsize(m["__path__"])
+            sz = os.path.getsize(_lp(m["__path__"]))
             out.append((m["__path__"], r, sz))
         return out
 
@@ -2179,7 +2209,7 @@ class WorkflowOrchestrator:
             if not sub:
                 return None
             best_path = max((m["__path__"] for m in sub),
-                            key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0)
+                            key=lambda p: os.path.getsize(_lp(p)) if os.path.exists(_lp(p)) else 0)
             return BestSelection(best_path, None, False)
         best = BestSelector.choose(scored)
         for path, sr, sz in scored:
@@ -2213,10 +2243,10 @@ class WorkflowOrchestrator:
             new_path = FoobarPathBuilder.build(self.input_dir, m, multi_disc=multi)
             new_path = _resolve_collision(new_path, b.path)
             try:
-                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                _mkparent(new_path)
                 if new_path != b.path:
                     old_dir = os.path.dirname(b.path)
-                    os.rename(b.path, new_path)
+                    os.rename(_lp(b.path), _lp(new_path))
                     _prune_empty_dirs(old_dir)  # 移動で空になった元フォルダを掃除
                 new_paths.append(new_path)
             except OSError:
@@ -2315,9 +2345,9 @@ class WorkflowOrchestrator:
             new_path = FoobarPathBuilder.build(self.output_dir, m, multi_disc=multi)
             new_path = _resolve_collision(new_path, p)
             try:
-                os.makedirs(os.path.dirname(new_path), exist_ok=True)
+                _mkparent(new_path)
                 if new_path != p:
-                    os.rename(p, new_path)
+                    os.rename(_lp(p), _lp(new_path))
             except OSError:
                 pass
         self.progress_cb("[STAGE 3] 整列完了")
@@ -2325,6 +2355,7 @@ class WorkflowOrchestrator:
 
 # ===== 安全読み込み =====
 def load_audio_safe(path):
+    path = _lp(path)
     try:
         data, sr = sf.read(path, always_2d=True, dtype="float32")
         return data.T, sr
@@ -2347,16 +2378,17 @@ def _try_sf_write(path, data, sr, subtype, fmt):
     sf.info で truncated / 形状不一致は同等に検出でき、96kHz/24bit FLAC の
     全サンプル再読み込み (重い I/O+CPU) を毎ファイル省ける。出力バイトは不変。
     失敗時は中途半端に残ったファイルを削除して False を返す。"""
+    lp = _lp(path)
     try:
-        sf.write(path, data, sr, subtype=subtype, format=fmt)
-        info = sf.info(path)
+        sf.write(lp, data, sr, subtype=subtype, format=fmt)
+        info = sf.info(lp)
         if info.samplerate != sr or (info.frames, info.channels) != tuple(data.shape):
             raise RuntimeError("write verification mismatch")
         return True
     except Exception:
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            if os.path.exists(lp):
+                os.remove(lp)
         except OSError:
             pass
         return False
@@ -2647,8 +2679,14 @@ def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister
     base = os.path.splitext(out_path)[0]
     final_path = base + OUTPUT_EXT
 
+    # tmp は **短い uuid 名** にする (final 名に長い suffix を足すと、254 字級の
+    # 多人数 artist 名で 1 コンポーネント 255 字制限を超え sf.write が失敗するため)。
+    import uuid as _uuid
+    _outdir = os.path.dirname(final_path) or "."
+    _tmpstem = os.path.join(_outdir, "_dsre_" + _uuid.uuid4().hex)
+    tmp_path = _tmpstem + ".src.flac"
+
     # 一時 FLAC に書込 (メタデータ無し)、PCM_24 → PCM_16 の順に試行
-    tmp_path = final_path + ".tmp_src.flac"
     wrote = False
     for subtype in (OUTPUT_SUBTYPE, OUTPUT_SUBTYPE_FALLBACK):
         if _try_sf_write(tmp_path, data, sr, subtype, OUTPUT_FORMAT):
@@ -2667,15 +2705,15 @@ def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister
     # 検証後に atomic os.replace で final_path に確定する。
     # 直書きしていた旧実装は、ffmpeg がクラッシュ/中断した時に final_path に
     # 壊れたファイルを残し、呼出側の send2trash で元音源が消える事故になり得た。
-    tmp_out_path = final_path + ".tmp_out.flac"
+    tmp_out_path = _tmpstem + ".out.flac"
     cmd = [
         "ffmpeg", "-y",
-        "-i", tmp_path,     # 音声ソース (DSP 済 FLAC)
-        "-i", in_path,      # メタデータソース (元 FLAC 等)
+        "-i", _lp(tmp_path),   # 音声ソース (DSP 済 FLAC)
+        "-i", _lp(in_path),    # メタデータソース (元 FLAC 等)
         "-map", "0:a",
         "-map_metadata", "1",
         "-c", "copy",
-        tmp_out_path,
+        _lp(tmp_out_path),
     ]
     ffmpeg_ok = False
     try:
@@ -2685,21 +2723,21 @@ def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister
         # ffmpeg 失敗/中断: メタ無しでも音声本体 (tmp_path) は確保されている
         # → メタ無しのまま tmp_out_path にしておく
         try:
-            if os.path.exists(tmp_out_path):
-                os.remove(tmp_out_path)
+            if os.path.exists(_lp(tmp_out_path)):
+                os.remove(_lp(tmp_out_path))
         except OSError:
             pass
         try:
             # tmp_path をそのまま tmp_out_path にする (メタなし FLAC)
-            os.replace(tmp_path, tmp_out_path)
+            os.replace(_lp(tmp_path), _lp(tmp_out_path))
             ffmpeg_ok = True  # メタ無しだが音声は OK
         except OSError:
             ffmpeg_ok = False
 
     # メタ取込が成功していれば tmp_path を片付ける
     try:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(_lp(tmp_path)):
+            os.remove(_lp(tmp_path))
     except OSError:
         pass
 
@@ -2711,17 +2749,18 @@ def save_flac24_out(in_path, y_out, sr, out_path, register_proc=None, unregister
     if not ok:
         # 壊れた tmp_out は捨てる、final_path は触らない
         try:
-            os.remove(tmp_out_path)
+            os.remove(_lp(tmp_out_path))
         except OSError:
             pass
         raise RuntimeError(f"出力検証失敗 ({reason}): {final_path}")
 
     # 検証 OK → atomic 置換で final_path に確定
     try:
-        os.replace(tmp_out_path, final_path)
+        _mkparent(final_path)
+        os.replace(_lp(tmp_out_path), _lp(final_path))
     except OSError as e:
         try:
-            os.remove(tmp_out_path)
+            os.remove(_lp(tmp_out_path))
         except OSError:
             pass
         raise RuntimeError(f"final_path 置換失敗 ({e}): {final_path}")
@@ -2744,7 +2783,7 @@ def _verify_output_file(out_path: str, ref_data: np.ndarray, ref_sr: int) -> tup
     無音検出は「ffmpeg/sf がエラー時に空ファイル/全0 を書いた」事故の検出が目的。
     """
     try:
-        info = sf.info(out_path)
+        info = sf.info(_lp(out_path))
     except Exception as e:
         return False, f"info読込失敗:{type(e).__name__}"
 
@@ -3578,7 +3617,7 @@ class Worker(QtCore.QThread):
 
             # ---- 事前: ディスク空き確認 (入力 size × 4 倍を要求、96k FLAC 拡張余裕込み) ----
             try:
-                in_size = os.path.getsize(path)
+                in_size = os.path.getsize(_lp(path))
                 du = shutil.disk_usage(OUTPUT_DIR)
                 if du.free < max(in_size * 4, 50 * 1024 * 1024):
                     _log_failure(path, "disk_short",
