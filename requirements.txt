@@ -8,3 +8,4 @@ send2trash==1.8.3
 pyloudnorm==0.1.1
 threadpoolctl==3.5.0
 mutagen>=1.47.0
+demucs==4.0.1

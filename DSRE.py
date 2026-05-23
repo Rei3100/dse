@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r147"
+_DSRE_VERSION = "r148"
 
 
 # ===== DSP パラメータ =====
@@ -789,6 +789,30 @@ class FingerprintEngine:
                     computed_at  TEXT NOT NULL
                 )
             """)
+            # 録音/編成 同一性判定用 MFCC 時系列 cache。同一作曲・同一 presence 内で
+            # 「同じ録音/編成 (全員版/ソロ版/別マスター)」を分離・統合するのに使う。
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS mfcc (
+                    content_hash TEXT PRIMARY KEY,
+                    n_coef       INTEGER NOT NULL,
+                    n_frames     INTEGER NOT NULL,
+                    data         BLOB NOT NULL,
+                    computed_at  TEXT NOT NULL
+                )
+            """)
+            # Demucs ボーカル stem 特徴 cache (編成判定の主信号)。
+            # vocal_ratio = vocal stem RMS / full RMS で presence (vocal/instrumental)、
+            # MFCC (vocal stem) で編成 (全員版/ソロ版) を分離する。
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS vocal_stem (
+                    content_hash TEXT PRIMARY KEY,
+                    vocal_ratio  REAL NOT NULL,
+                    n_coef       INTEGER NOT NULL,
+                    n_frames     INTEGER NOT NULL,
+                    mfcc         BLOB NOT NULL,
+                    computed_at  TEXT NOT NULL
+                )
+            """)
 
     @staticmethod
     def _content_hash(path: str) -> str:
@@ -923,6 +947,114 @@ class FingerprintEngine:
             pass
         return val
 
+    def compute_mfcc(self, path: str) -> "np.ndarray | None":
+        """録音/編成同一性判定用の固定長 MFCC (n_coef x _MFCC_N) を返す。cache 付き。
+        c0 (全体エネルギー) は除外し各係数を z-正規化。同一録音/編成は高相関、別編成
+        (全員版/ソロ版/インスト) は低相関になる。メタデータ非依存。失敗時 None。"""
+        try:
+            ch = self._content_hash(path)
+        except OSError:
+            return None
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute(
+                "SELECT n_coef, n_frames, data FROM mfcc WHERE content_hash = ?",
+                (ch,)).fetchone()
+            if row:
+                arr = np.frombuffer(row[2], dtype=np.float16).astype(np.float32)
+                return arr.reshape(row[0], row[1])
+        try:
+            out = _absolute_mfcc(path)
+            if out is None:
+                return None
+        except Exception:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as c:
+                c.execute("INSERT OR REPLACE INTO mfcc VALUES (?, ?, ?, ?, ?)",
+                          (ch, out.shape[0], out.shape[1], out.astype(np.float16).tobytes(),
+                           datetime.datetime.utcnow().isoformat()))
+        except Exception:
+            pass
+        return out
+
+    def compute_vocal_features(self, path: str) -> "tuple | None":
+        """Demucs でボーカル stem を分離し (vocal_ratio, vocal_stem_MFCC) を返す。cache 付き。
+        vocal_ratio = vocal RMS / full RMS → presence (vocal>~0.3 / instrumental<~0.1)。
+        MFCC は vocal stem の音色時系列 → 編成 (全員版 vs ソロ版) を分離する。
+        共有伴奏を除去するため、全体スペクトルでは不可能だった編成判定が可能になる。
+        重い (Demucs) ので **複数 file cluster の version 判定時のみ** 呼ぶこと。失敗時 None。"""
+        if os.environ.get("DSRE_DEMUCS", "1") == "0":
+            return None  # Demucs 無効化 (テスト/フォールバック)。dedup は full-MFCC に縮退
+        try:
+            ch = self._content_hash(path)
+        except OSError:
+            return None
+        with sqlite3.connect(self.db_path) as c:
+            row = c.execute(
+                "SELECT vocal_ratio, n_coef, n_frames, mfcc FROM vocal_stem "
+                "WHERE content_hash = ?", (ch,)).fetchone()
+            if row:
+                arr = np.frombuffer(row[3], dtype=np.float16).astype(np.float32).reshape(row[1], row[2])
+                return (float(row[0]), arr)
+        try:
+            import librosa
+            import soundfile as _sf
+            model, device = _get_demucs()
+            import torch
+            from demucs.apply import apply_model
+            msr = model.samplerate
+            y, sr = _sf.read(path, dtype="float32")
+            if y.ndim == 1:
+                y = np.stack([y, y], axis=1)
+            y = y[: sr * _CHROMA_MAX_SEC]
+            if sr != msr:
+                y = np.stack([librosa.resample(y[:, 0], orig_sr=sr, target_sr=msr),
+                              librosa.resample(y[:, 1], orig_sr=sr, target_sr=msr)], axis=1)
+            wav = torch.tensor(y.T)[None]
+            with torch.no_grad():
+                srcs = apply_model(model, wav, device=device, split=True, overlap=0.1)[0]
+            vi = model.sources.index("vocals")
+            voc = srcs[vi].mean(0).cpu().numpy()
+            full_rms = float(np.sqrt((y.mean(axis=1) ** 2).mean())) + 1e-9
+            voc_rms = float(np.sqrt((voc ** 2).mean()))
+            ratio = voc_rms / full_rms
+            vv = librosa.resample(voc, orig_sr=msr, target_sr=_CHROMA_SR)
+            out = _mfcc_absolute(vv, _CHROMA_SR)  # 絶対フレーム (interp 伸縮なし)
+            if out is None:
+                return None
+        except Exception:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as c:
+                c.execute("INSERT OR REPLACE INTO vocal_stem VALUES (?, ?, ?, ?, ?, ?)",
+                          (ch, ratio, out.shape[0], out.shape[1], out.astype(np.float16).tobytes(),
+                           datetime.datetime.utcnow().isoformat()))
+        except Exception:
+            pass
+        return (ratio, out)
+
+
+# ===== Demucs ボーカル分離モデル (編成判定の主信号、遅延ロード singleton) =====
+_DEMUCS_MODEL = None
+_DEMUCS_DEVICE = None
+
+
+def _get_demucs():
+    """htdemucs モデルと device (GPU 使用可なら cuda) を遅延ロードして返す。"""
+    global _DEMUCS_MODEL, _DEMUCS_DEVICE
+    if _DEMUCS_MODEL is None:
+        from demucs.pretrained import get_model
+        import torch
+        m = get_model("htdemucs")
+        m.eval()
+        _DEMUCS_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            m.to(_DEMUCS_DEVICE)
+        except Exception:
+            _DEMUCS_DEVICE = "cpu"
+        _DEMUCS_MODEL = m
+    return _DEMUCS_MODEL, _DEMUCS_DEVICE
+
 
 # ===== chroma 同曲判定 (移調不変・時系列相関) =====
 _CHROMA_SR = 22050
@@ -930,6 +1062,55 @@ _CHROMA_HOP = 2048
 _CHROMA_N = 256          # 時間軸を固定長に正規化 (tempo/尺差を吸収)
 _CHROMA_MAX_SEC = 240
 _CHROMA_MAX_LAG = 16     # ±フレームの開始オフセットずれを許容
+_MFCC_CAP_SEC = 180      # MFCC は先頭 180s を **絶対フレーム** で比較 (interp 伸縮はしない)
+_MFCC_MAX_LAG = 100      # ±フレーム (~2.3s) の開始オフセットずれを許容
+# 注: 録音/編成判定は同テンポなので時間軸を伸縮 (interp) してはいけない。実測で
+# interp は同編成ペアを 0.94→0.80 に落とした。絶対フレーム+lag が正解。
+
+
+def _mfcc_absolute(y, sr):
+    """mono 信号 → 絶対フレーム MFCC (c0 除外・各係数 z 正規化)。先頭 _MFCC_CAP_SEC 秒。"""
+    import librosa
+    y = y[: int(sr * _MFCC_CAP_SEC)]
+    if y.size < sr:
+        return None
+    mf = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20, hop_length=512)[1:]
+    if mf.shape[1] < 2:
+        return None
+    mf = mf - mf.mean(axis=1, keepdims=True)
+    mf = mf / (mf.std(axis=1, keepdims=True) + 1e-9)
+    return mf.astype(np.float32)
+
+
+def _absolute_mfcc(path):
+    """file path → 絶対フレーム MFCC。失敗時 None。"""
+    import librosa
+    y, _sr = librosa.load(path, sr=_CHROMA_SR, mono=True, duration=_MFCC_CAP_SEC)
+    return _mfcc_absolute(y, _CHROMA_SR)
+
+
+def recording_similarity(ma, mb, max_lag: int = _MFCC_MAX_LAG) -> float:
+    """2 つの固定長 MFCC (n_coef x N) の録音/編成同一度を 0..1 で返す。
+    ±max_lag 時間シフトの最大正規化相互相関 (移調はしない: 同録音は同キー)。実測:
+    同一録音=0.95-1.0 / 同編成別マスター=~0.5+ / 別編成(全員/ソロ)=~0.31-0.38 と分離。"""
+    if ma is None or mb is None:
+        return 0.0
+    A = ma
+    B = mb
+    nA = float(np.linalg.norm(A))
+    if nA < 1e-9:
+        return 0.0
+    T = min(A.shape[1], B.shape[1])
+    A = A[:, :T]
+    B = B[:, :T]
+    best = -1.0
+    for lag in range(-max_lag, max_lag + 1):
+        Bs = np.roll(B, lag, axis=1)
+        den = nA * float(np.linalg.norm(Bs)) + 1e-9
+        val = float((A * Bs).sum()) / den
+        if val > best:
+            best = val
+    return max(0.0, best)
 
 
 def chroma_similarity(ca, cb, max_lag: int = _CHROMA_MAX_LAG) -> float:
@@ -1915,20 +2096,59 @@ class WorkflowOrchestrator:
         meta = [MetadataExtractor.extract(p) for p in cluster]
         return meta
 
-    def version_groups(self, metas: list) -> list:
-        """chroma 同曲 cluster を「視聴体験が異なる版」ごとに分割する。
-        主信号は **音響ボーカル有無** (compute_vocalness、メタデータ非依存)。
-        加えてタグ (vocal_type/live_type/arrange_type/version_info) があれば併用
-        (タグが無くても音響だけで vocal/instrumental を分離できる)。
-        cover_type/remaster 等では分割しない (同一視聴体験 → 最良 1 個に dedup)。"""
-        vals = [self.fp_engine.compute_vocalness(m["__path__"]) for m in metas]
-        labels = _acoustic_version_labels(vals)
-        groups: dict = {}
-        for m, lab in zip(metas, labels):
-            raw = m.get("__rawtags__") or {}
-            tagkey = tuple((raw.get(t) or [""])[0].lower() for t in _SPLIT_VERSION_TAGS)
-            groups.setdefault((lab,) + tagkey, []).append(m)
-        return list(groups.values())
+    def dedup_groups(self, metas: list) -> list:
+        """chroma 同曲 cluster を「同一録音/編成」単位に分割する (**メタデータ非依存・Demucs**)。
+        3 段階の純音響判定:
+          1. Demucs vocal stem の vocal_ratio で presence (vocal / instrumental) を分離
+          2. vocal 群: vocal-stem MFCC で編成を sub-cluster (全員版/ソロ版/別歌唱を分離、
+             同編成は別マスターでも統合)。共有伴奏を除去するので全体スペクトルでは
+             不可能だった編成判定ができる
+          3. instrumental 群: full MFCC で録音を sub-cluster
+        各 group 内は同一録音/編成なので最良 1 個に dedup。タグは一切使わない。
+        singleton cluster は Demucs を呼ばない (重いので無駄を避ける)。"""
+        if len(metas) < 2:
+            return [metas]
+        presence_thresh = float(os.environ.get("DSRE_VOCAL_PRESENCE", "0.30"))
+        arr_thresh = float(os.environ.get("DSRE_VOCAL_ARRANGEMENT_SIM", "0.75"))
+        rec_thresh = float(os.environ.get("DSRE_RECORDING_SIMILARITY", "0.75"))
+        vocal, inst = [], []
+        vfeat = {}
+        for i, m in enumerate(metas, 1):
+            self.progress_cb(f"[STAGE 1] ボーカル分離 {i}/{len(metas)}")
+            if self.abort_cb():
+                return [metas]
+            vf = self.fp_engine.compute_vocal_features(m["__path__"])
+            vfeat[m["__path__"]] = vf
+            if vf is not None and vf[0] >= presence_thresh:
+                vocal.append(m)
+            else:
+                inst.append(m)
+        out = []
+        # 2) vocal 群: vocal-stem MFCC で編成 sub-cluster
+        out += self._subcluster(
+            vocal, arr_thresh,
+            lambda p: (vfeat.get(p)[1] if vfeat.get(p) is not None else None),
+            recording_similarity)
+        # 3) instrumental 群: full MFCC で録音 sub-cluster
+        out += self._subcluster(
+            inst, rec_thresh,
+            lambda p: self.fp_engine.compute_mfcc(p),
+            recording_similarity)
+        return out
+
+    @staticmethod
+    def _subcluster(group: list, thresh: float, feat_fn, sim_fn) -> list:
+        """group を feat_fn(path) の sim_fn 類似度 (>=thresh) で union-find sub-cluster 化。"""
+        if len(group) < 2:
+            return [group] if group else []
+        feats = {m["__path__"]: feat_fn(m["__path__"]) for m in group}
+        cb = ClusterBuilder(similarity_threshold=thresh)
+        keys = [m["__path__"] for m in group]
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                cb.add_pair(keys[i], keys[j], sim_fn(feats[keys[i]], feats[keys[j]]))
+        by_path = {m["__path__"]: m for m in group}
+        return [[by_path[p] for p in sub] for sub in cb.build(items=keys)]
 
     def score_files(self, meta_list: list) -> list:
         out = []
@@ -2012,11 +2232,11 @@ class WorkflowOrchestrator:
             if self.abort_cb():
                 break
             metas = [MetadataExtractor.extract(p) for p in c]
-            # 先に「視聴体験が異なる版」(音響ボーカル有無 + タグ) で分割し、
-            # **各版グループ内で** メタ統合する。cluster 全体を一括統合すると
-            # vocal(track1) と instrumental(track2) で tracknumber 等が混線するため。
-            for g in self.version_groups(metas):
-                MetadataPropagator.propagate(g)  # 版グループ内で統合
+            # 純音響で「同一録音/編成」単位に分割 (vocal/instrumental → 全員/ソロ等)。
+            # 各グループ **内で** メタ統合する。cluster 全体を一括統合すると別編成間で
+            # tracknumber 等が混線するため (vocal track1 が instrumental track2 を上書き)。
+            for g in self.dedup_groups(metas):
+                MetadataPropagator.propagate(g)  # 同一録音グループ内で統合
                 g2 = [MetadataExtractor.extract(m["__path__"]) for m in g]
                 best = self.process_subcluster(g2)
                 if best:
