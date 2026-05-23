@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r151"
+_DSRE_VERSION = "r152"
 
 
 # ===== DSP パラメータ =====
@@ -4473,6 +4473,10 @@ def _run_workflow_selftest() -> int:
     INPUT_DIR top-level の flac をサンドボックスに複製し run_stage1 を完走
     させる (実ファイルは触らない)。GUI クリックなしで「開始経路が生きているか」
     を実測する手段。"""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     import tempfile, traceback
     add_ffmpeg_to_path()
     src = INPUT_DIR
@@ -4512,6 +4516,10 @@ def _run_workflow_fulltest() -> int:
     """凍結 exe で GUI 完全経路 (QThread + GPU + Demucs + 処理 + 長パス保存 + 整列) を
     実 INPUT のサンドボックス複製で end-to-end 検証する。実機の Worker.start() 経路を
     忠実に再現する (run_stage1 単体の workflow-selftest より厳密)。実ファイルは触らない。"""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     global INPUT_DIR, OUTPUT_DIR
     import tempfile, traceback
     add_ffmpeg_to_path()
