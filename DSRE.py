@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r152"
+_DSRE_VERSION = "r153"
 
 
 # ===== DSP パラメータ =====
@@ -4492,7 +4492,23 @@ def _run_workflow_selftest() -> int:
             dst = os.path.join(indir, f)
             shutil.copy2(os.path.join(src, f), dst)
             cand.append(dst)
-        print(f"workflow-selftest: INPUT top-level flac={len(flacs)} using={len(cand)}")
+        synth = False
+        if not cand:
+            # INPUT が空 (CI runner 等): 合成 fixture を生成して実 stage1 経路を必ず走らせる。
+            # 開始判定経路 (scan→cluster→select) が生きているかの standing gate。精度検証ではない。
+            synth = True
+            import numpy as _np, soundfile as _sf
+            sr = 44100
+            t = _np.linspace(0, 1.0, sr, endpoint=False, dtype=_np.float32)
+            for i, freq in enumerate((440.0, 660.0)):       # 2 曲ぶんの別波形
+                wav = (0.2 * _np.sin(2 * _np.pi * freq * t)).astype(_np.float32)
+                stereo = _np.stack([wav, wav], axis=1)
+                for v in range(2):                            # 各曲 2 version
+                    p = os.path.join(indir, f"synth_{i}_{v}.flac")
+                    _sf.write(p, stereo, sr, format="FLAC")
+                    cand.append(p)
+        print(f"workflow-selftest: INPUT top-level flac={len(flacs)} "
+              f"using={len(cand)} synth={synth}")
         orch = WorkflowOrchestrator(
             input_dir=indir, output_dir=outdir,
             db_path=os.path.join(sb, "fp.db"),

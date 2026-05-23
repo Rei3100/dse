@@ -129,6 +129,17 @@ jobs:
           }
           if ($code -ne 0) { throw "runtime selftest failed with exit $code" }
 
+      - name: 実経路ゲート (--workflow-selftest で 開始判定経路を実測)
+        shell: pwsh
+        run: |
+          # CI runner には C:\Audio\DSRE が無いので合成 fixture で実 run_stage1 経路を完走させる。
+          # 「開始押しても動かない」型 (stage1 が空を返し処理対象が消える) の silent regression を build 段で捕捉する。
+          # 合成 selftest (import) では絶対に捕まらない、実行経路の生死を凍結 exe で確認する standing gate。
+          $proc = Start-Process -FilePath "dist\DSRE\DSRE.exe" -ArgumentList "--workflow-selftest" -Wait -PassThru -NoNewWindow
+          $code = $proc.ExitCode
+          if ($code -ne 0) { throw "workflow real-path gate failed with exit $code (開始判定経路が死んでいる)" }
+          Write-Host "workflow real-path gate OK"
+
       - name: zip 化（_internal + exe を release 直下に配置）
         shell: pwsh
         run: |
