@@ -35,7 +35,7 @@ OUTPUT_DIR = r"C:\Audio\DSRE\Output"
 METRICS_DB_PATH = r"C:\FreeSoft\DSRE\dsre_log.db"
 
 
-_DSRE_VERSION = "r150"
+_DSRE_VERSION = "r151"
 
 
 # ===== DSP パラメータ =====
@@ -4508,11 +4508,61 @@ def _run_workflow_selftest() -> int:
         shutil.rmtree(sb, ignore_errors=True)
 
 
+def _run_workflow_fulltest() -> int:
+    """凍結 exe で GUI 完全経路 (QThread + GPU + Demucs + 処理 + 長パス保存 + 整列) を
+    実 INPUT のサンドボックス複製で end-to-end 検証する。実機の Worker.start() 経路を
+    忠実に再現する (run_stage1 単体の workflow-selftest より厳密)。実ファイルは触らない。"""
+    global INPUT_DIR, OUTPUT_DIR
+    import tempfile, traceback
+    add_ffmpeg_to_path()
+    src = INPUT_DIR
+    flacs = ([f for f in os.listdir(src) if f.lower().endswith(".flac")]
+             if os.path.isdir(src) else [])
+    if not flacs:
+        print("workflow-fulltest: INPUT に flac なし"); return 0
+    sb = tempfile.mkdtemp(prefix="dsre_full_")
+    indir = os.path.join(sb, "in"); outdir = os.path.join(indir, "Output")
+    os.makedirs(outdir)
+    for f in flacs:
+        shutil.copy2(os.path.join(src, f), os.path.join(indir, f))
+    _oi, _oo = INPUT_DIR, OUTPUT_DIR
+    INPUT_DIR, OUTPUT_DIR = indir, outdir
+    try:
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        files = _scan_pending_files(indir, outdir)
+        print(f"workflow-fulltest: pending={len(files)}", flush=True)
+        w = Worker(files, level=1)
+        w.sig_text.connect(lambda s: print("  ", s, flush=True), QtCore.Qt.DirectConnection)
+        done = {"v": False}
+        w.finished.connect(lambda: done.__setitem__("v", True))
+        w.start()
+        while not done["v"]:
+            app.processEvents()
+            time.sleep(0.05)
+        outs = [os.path.join(r, f) for r, _, fs in os.walk(outdir)
+                for f in fs if f.lower().endswith(".flac")]
+        print(f"workflow-fulltest: OUTPUT={len(outs)}", flush=True)
+        for o in outs:
+            print("   ", os.path.relpath(o, outdir)[-60:], flush=True)
+        ok = len(outs) >= 1
+        print("workflow-fulltest verdict=" + ("OK" if ok else "FAIL"), flush=True)
+        return 0 if ok else 1
+    except Exception:
+        traceback.print_exc()
+        print("workflow-fulltest verdict=FAIL")
+        return 1
+    finally:
+        INPUT_DIR, OUTPUT_DIR = _oi, _oo
+        shutil.rmtree(sb, ignore_errors=True)
+
+
 def main():
     if "--selftest" in sys.argv:
         sys.exit(_run_selftest())
     if "--workflow-selftest" in sys.argv:
         sys.exit(_run_workflow_selftest())
+    if "--workflow-fulltest" in sys.argv:
+        sys.exit(_run_workflow_fulltest())
     add_ffmpeg_to_path()
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
